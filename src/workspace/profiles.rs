@@ -70,6 +70,8 @@ pub struct Profiles {
     /// Whether `-Zhint-min-opt-level` was passed, enabling the
     /// `hints.min-opt-level` manifest key.
     hint_min_opt_level: bool,
+    /// See [`Profiles::enable_default_dev_codegen_backend`].
+    default_dev_codegen_backend: Option<InternedString>,
 }
 
 impl Profiles {
@@ -93,6 +95,7 @@ impl Profiles {
             requested_profile,
             rustc_host,
             hint_min_opt_level: gctx.cli_unstable().hint_min_opt_level,
+            default_dev_codegen_backend: None,
         };
 
         Self::add_root_profiles(&mut profile_makers, &profiles);
@@ -274,6 +277,42 @@ impl Profiles {
         Ok(maker)
     }
 
+    /// Compiles local packages for the host with the Cranelift backend in
+    /// profiles derived from `dev` that do not pick a backend themselves.
+    ///
+    /// Only when the rustc in use is a nightly with the Cranelift backend
+    /// installed (`rustup component add rustc-codegen-cranelift-preview`).
+    /// Dependencies stay on LLVM: they are built once, and use SIMD
+    /// intrinsics Cranelift does not fully support.
+    pub fn enable_default_dev_codegen_backend(&mut self, gctx: &GlobalContext) -> CargoResult<()> {
+        #[expect(clippy::disallowed_methods, reason = "fork-only opt out")]
+        if std::env::var("CARGO_DEV_CRANELIFT").as_deref() == Ok("0") {
+            return Ok(());
+        }
+        let rustc = gctx.load_global_rustc(None)?;
+        if !matches!(rustc.version.pre.as_str(), "nightly" | "dev") {
+            return Ok(());
+        }
+        let mut cmd = rustc.process_no_wrapper();
+        cmd.arg("--print").arg("sysroot");
+        let (sysroot, _) = rustc.cached_output(&cmd, 0)?;
+        let backends = std::path::Path::new(sysroot.trim())
+            .join("lib/rustlib")
+            .join(rustc.host.as_str())
+            .join("codegen-backends");
+        let has_cranelift = std::fs::read_dir(&backends).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.contains("rustc_codegen_cranelift"))
+            })
+        });
+        if has_cranelift {
+            self.default_dev_codegen_backend = Some("cranelift".into());
+        }
+        Ok(())
+    }
+
     /// Retrieves the profile for a target.
     /// `is_member` is whether or not this package is a member of the
     /// workspace.
@@ -338,6 +377,20 @@ impl Profiles {
         // (see also https://github.com/rust-lang/cargo/issues/3972)
         if !is_local {
             profile.incremental = false;
+        }
+
+        if let Some(backend) = self.default_dev_codegen_backend {
+            let is_host_target = match &kind {
+                CompileKind::Host => true,
+                CompileKind::Target(target) => target.short_name() == self.rustc_host.as_str(),
+            };
+            if is_local
+                && is_host_target
+                && profile.root == ProfileRoot::Debug
+                && profile.codegen_backend.is_none()
+            {
+                profile.codegen_backend = Some(backend);
+            }
         }
         profile.name = self.requested_profile;
         profile
@@ -490,6 +543,18 @@ impl ProfileMaker {
         min_opt_level: Option<u32>,
     ) -> Profile {
         let mut profile = self.default.clone();
+
+        // `dev` keeps line tables for workspace members (enough for
+        // backtraces) and no debuginfo for dependencies: full debuginfo is a
+        // large share of build time and of the build-dir's size. An explicit
+        // `debug` anywhere below overrides this.
+        if profile.root == ProfileRoot::Debug {
+            profile.debuginfo = DebugInfo::Resolved(if is_member || pkg_id.is_none() {
+                TomlDebugInfo::LineTablesOnly
+            } else {
+                TomlDebugInfo::None
+            });
+        }
 
         // First apply profile-specific settings, things like
         // `[profile.release]`

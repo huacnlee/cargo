@@ -403,7 +403,12 @@ pub fn create_bcx<'a, 'gctx>(
         );
     }
 
-    let profiles = Profiles::new(ws, build_config.requested_profile)?;
+    let mut profiles = Profiles::new(ws, build_config.requested_profile)?;
+    // Cranelift cannot unwind on every platform, which tests rely on, and
+    // checking does no codegen.
+    if matches!(build_config.intent, UserIntent::Build) {
+        profiles.enable_default_dev_codegen_backend(gctx)?;
+    }
     profiles.validate_packages(
         ws.profiles(),
         &mut gctx.shell(),

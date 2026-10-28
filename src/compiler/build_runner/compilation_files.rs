@@ -314,6 +314,17 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     }
 
     /// The lock location for a given build unit.
+    /// The directory holding every file of a build unit (new layout).
+    pub fn build_unit_dir(&self, unit: &Unit) -> PathBuf {
+        let dir = self.pkg_dir(unit);
+        self.layout(unit.kind).build_dir().build_unit(&dir)
+    }
+
+    /// All layouts in use: the host one and one per cross-compile target.
+    pub fn layouts(&self) -> impl Iterator<Item = &Layout> {
+        std::iter::once(&self.host).chain(self.target.values())
+    }
+
     pub fn build_unit_lock(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.layout(unit.kind)
@@ -843,6 +854,12 @@ fn compute_metadata(
                 .links_overrides
                 != unit.links_overrides;
         target_configs_are_different.hash(&mut shared_hasher);
+    }
+
+    if !unit.is_std && unit.pkg.package_id().source_id().is_path() {
+        if let Some(root) = bcx.ws.shared_build_dir_root() {
+            root.hash(&mut shared_hasher);
+        }
     }
 
     let ws_root = if unit.is_std {

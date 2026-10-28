@@ -431,6 +431,32 @@ pub struct CargoBuildConfig {
     /// Unstable feature `-Zchecksum-freshness`.
     pub fingerprint: Option<FingerprintMethod>,
     pub build_std: Option<BuildStdConfig>,
+    /// Automatic garbage collection of stale build units in the build-dir.
+    pub gc: Option<BuildDirGcConfig>,
+}
+
+/// Configuration for automatic build-dir garbage collection.
+///
+/// ```toml
+/// [build.gc]
+/// enabled = true
+/// max-unused = "7 days"
+/// max-size = "auto" # 10 GiB, or twice what the build uses
+/// frequency = "1 hour"
+/// ```
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct BuildDirGcConfig {
+    pub enabled: Option<bool>,
+    /// Build units not used for longer than this are removed.
+    pub max_unused: Option<String>,
+    /// When the build-dir grows past this size, least recently used build
+    /// units are removed until it fits. `"none"` disables the size limit;
+    /// `"auto"` (the default) is 10 GiB or twice what the build uses. Counts
+    /// the whole build-dir: every target and profile.
+    pub max_size: Option<String>,
+    /// How often to scan the build-dir: `"always"`, `"never"`, or a span.
+    pub frequency: Option<String>,
 }
 
 /// Metrics collection for build analysis.

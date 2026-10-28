@@ -16,6 +16,7 @@ use crate::command_prelude::*;
 
 fn main() {
     let _guard = setup_logger();
+    pin_rustup_toolchain();
 
     let mut gctx = match GlobalContext::default() {
         Ok(gctx) => gctx,
@@ -386,5 +387,55 @@ fn init_git() {
     unsafe {
         git2::opts::set_verify_owner_validation(false)
             .expect("set_verify_owner_validation should never fail");
+    }
+}
+
+/// Pins the toolchain rustup picks for this directory, as the rustup `cargo`
+/// proxy does, when this Cargo is run directly instead of through the proxy.
+///
+/// Otherwise every `rustc` proxy Cargo spawns resolves the toolchain from its
+/// own working directory, and a dependency shipping a `rust-toolchain.toml`
+/// gets compiled by a different compiler than the rest of the build.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "runs before the config is loaded"
+)]
+fn pin_rustup_toolchain() {
+    // Installed in place of the rustup proxy, so honour `cargo +<toolchain>`
+    // the way the proxy would: re-run under that toolchain.
+    let mut args = std::env::args_os().skip(1);
+    if let Some(toolchain) = args.next().and_then(|a| {
+        a.to_str()
+            .and_then(|a| a.strip_prefix('+'))
+            .map(str::to_owned)
+    }) {
+        let exe = std::env::current_exe().unwrap_or_else(|_| "cargo".into());
+        let status = std::process::Command::new("rustup")
+            .args(["run", &toolchain])
+            .arg(exe)
+            .args(args)
+            .status();
+        match status {
+            Ok(status) => std::process::exit(status.code().unwrap_or(101)),
+            Err(e) => {
+                eprintln!("error: `+{toolchain}` requires rustup: {e}");
+                std::process::exit(101);
+            }
+        }
+    }
+    if std::env::var_os("RUSTUP_TOOLCHAIN").is_some() || std::env::var_os("RUSTC").is_some() {
+        return;
+    }
+    let Ok(out) = std::process::Command::new("rustup")
+        .args(["show", "active-toolchain"])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if let (true, Some(name)) = (out.status.success(), stdout.split_whitespace().next()) {
+        // SAFETY: single-threaded, before anything reads the environment.
+        unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", name) };
     }
 }

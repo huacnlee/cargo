@@ -845,6 +845,8 @@ macro_rules! unstable_cli_options {
                 };
 
                 unstable.build_dir_new_layout = !is_new_build_dir_layout_opt_out();
+                // Lets builds of several checkouts sharing a build-dir run concurrently.
+                unstable.fine_grain_locking = !is_fine_grain_locking_opt_out();
 
                 return unstable;
             }
@@ -1619,6 +1621,14 @@ pub fn is_nightly_toolchain(rustc_version: &semver::Version) -> bool {
 )]
 pub fn is_stop_rlib_uplift_opt_out() -> bool {
     env::var("__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT").as_deref() == Ok("1")
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Temporary opt out that is not part of the public interface"
+)]
+fn is_fine_grain_locking_opt_out() -> bool {
+    std::env::var("__CARGO_TEMPORARY_FINE_GRAIN_LOCKING_OPT_OUT").as_deref() == Ok("1")
 }
 
 #[expect(

@@ -1,37 +1,169 @@
-# Publish Cargo to crates.io whenever a new tag is pushed. Tags are pushed by
-# the Rust release process (https://github.com/rust-lang/promote-release),
-# which will cause this workflow to run.
+# Build huacnlee/cargo for every platform and publish a GitHub release when a
+# `v<cargo version>[-N]` tag is pushed, e.g. `v0.102.0-1`. install.sh and
+# install.ps1 download the assets this produces.
 
 name: Release
+
 on:
   push:
-    tags:
-      - "0.*"
+    tags: ['v*']
+  workflow_dispatch:
 
-# Prevent multiple releases from starting at the same time.
+permissions:
+  contents: read
+
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  crates-io:
-    name: Publish on crates.io
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write     # Required for OIDC token exchange
-
-    # Required for trusted publishing to work.
-    environment:
-      name: release
-
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15
+            target: x86_64-apple-darwin
+          # The oldest supported runners, so the binary needs an older glibc.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout the source code
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18  # v1.0.5
-        id: auth
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Publish Cargo to crates.io
-        run: ./publish.py
+      - name: Use a static Windows C runtime
+        if: runner.os == 'Windows'
+        run: echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Validate version and release tag
+        id: version
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 --manifest-path Cargo.toml \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "cargo"))')"
+          if [[ "$RELEASE_REF" == refs/tags/* ]]; then
+            version="${RELEASE_TAG#v}"
+            case "$version" in
+              "$cargo_version"|"$cargo_version"-*) ;;
+              *) echo "Release tag must be v$cargo_version or v$cargo_version-N, got $RELEASE_TAG" >&2; exit 1 ;;
+            esac
+          else
+            version="$cargo_version-dev"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test unix installer syntax
+        if: runner.os != 'Windows'
+        run: sh -n install.sh
+
+      - name: Validate PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path install.ps1), [ref]$tokens, [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors) {
+            $parseErrors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
+      - name: Test build-dir GC
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked --lib build_dir_gc
+
+      - name: Build release
+        # Statically link OpenSSL, curl and libgit2, as rust-lang ships cargo.
+        run: cargo build --locked --release --bin cargo --features all-static --target ${{ matrix.target }}
+
+      - name: Package release
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist stage
+          name="cargo-$RELEASE_VERSION-$RELEASE_TARGET"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$RELEASE_TARGET/release/cargo.exe" stage/
+            (cd stage && 7z a -tzip "../dist/$name.zip" cargo.exe >/dev/null)
+            asset="$name.zip"
+          else
+            cp "target/$RELEASE_TARGET/release/cargo" stage/
+            tar -czf "dist/$name.tar.gz" -C stage cargo
+            asset="$name.tar.gz"
+          fi
+          if [ "$RELEASE_TARGET" != x86_64-apple-darwin ]; then
+            "stage/cargo$([ "$RUNNER_OS" = Windows ] && echo .exe)" --version
+          fi
+          cd dist
+          if command -v sha256sum >/dev/null; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi > "$asset.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify and combine checksums
+        run: |
+          cd dist
+          cat *.sha256 | sort -k2 > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 5
+          sha256sum --check SHA256SUMS
+          rm -- *.sha256
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+            --title "cargo $RELEASE_TAG" dist/* install.sh install.ps1

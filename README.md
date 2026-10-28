@@ -1,3 +1,48 @@
+# huacnlee/cargo
+
+A fork of Cargo tuned for fast local builds and a bounded disk footprint,
+especially when many git worktrees (e.g. AI agents) build the same project.
+
+## Install
+
+Replaces `~/.cargo/bin/cargo` (the rustup proxy is kept as `cargo.rustup`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/huacnlee/cargo/HEAD/install.sh | sh
+# Windows: irm https://raw.githubusercontent.com/huacnlee/cargo/HEAD/install.ps1 | iex
+# Undo:    sh install.sh --uninstall
+```
+
+`cargo +nightly ...` and `rust-toolchain.toml` keep working through rustup.
+`rustup self update` reinstalls the proxy; rerun the installer afterwards.
+
+## What changes
+
+- **Shared build-dir**: intermediate artifacts live in
+  `~/.cargo/targets/<workspace-name>/` (name from the root package, else the git
+  repo, worktree-aware). Worktrees of a repo reuse registry/git dependencies;
+  local crates stay per checkout. Final binaries still land in `./target`.
+- **Automatic GC**: after each build, at most once an hour, unused build units
+  (7 days), stale incremental sessions and old-layout leftovers are removed,
+  then least-recently-used units until the build-dir fits `max-size`.
+- **Fine-grained locking** on by default, so worktrees build concurrently.
+- **Lighter dev debuginfo**: `line-tables-only` for workspace members, none for
+  dependencies, unless `debug` is set in a profile.
+- **On nightly**: Cranelift for local crates in `cargo build` (when the
+  `rustc-codegen-cranelift-preview` component is installed; `CARGO_DEV_CRANELIFT=0`
+  to disable) and a parallel front end (`-Zthreads`, `CARGO_RUSTC_THREADS=1` to disable).
+
+```toml
+# ~/.cargo/config.toml
+[build.gc]
+max-size = "auto"     # max(10 GiB, 2x the last build); or "15 GiB" / "none"
+max-unused = "7 days"
+frequency = "1 hour"  # or "always" / "never"
+enabled = true
+```
+
+---
+
 # Cargo
 
 Cargo downloads your Rust project’s dependencies and compiles your project.

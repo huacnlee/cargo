@@ -167,6 +167,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
     /// [`ops::cargo_compile`]: crate::ops::cargo_compile
     #[tracing::instrument(skip_all)]
     pub fn compile(mut self, exec: &Arc<dyn Executor>) -> CargoResult<Compilation<'gctx>> {
+        let build_start = std::time::SystemTime::now();
         // A shared lock is held during the duration of the build since rustc
         // needs to read from the `src` cache, and we don't want other
         // commands modifying the `src` cache while it is running.
@@ -206,6 +207,8 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
 
         // Now that we've figured out everything that we're going to do, do it!
         queue.execute(&mut self)?;
+
+        super::build_dir_gc::run(&self, build_start);
 
         // Add `OUT_DIR` to env vars if unit has a build script.
         let units_with_build_script = &self

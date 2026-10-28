@@ -807,6 +807,7 @@ impl GlobalContext {
                 let hash = crate::util::hex::short_hash(&real_path);
                 format!("{}{}{}", &hash[0..2], std::path::MAIN_SEPARATOR, &hash[2..])
             }),
+            ("{workspace-name}", workspace_name(workspace_manifest_path)),
         ];
 
         let template_variables = replacements
@@ -2202,6 +2203,63 @@ fn registry_name(gctx: &GlobalContext, sid: &SourceId) -> CargoResult<Option<Str
     };
 
     Ok(name)
+}
+
+/// A short name identifying a workspace for `{workspace-name}`, shared by
+/// every checkout of the same project so they can share a build-dir.
+///
+/// It is the root package's name, else the name of the git repository the
+/// workspace lives in (the main checkout's, for a `git worktree`), else the
+/// name of the workspace directory.
+fn workspace_name(workspace_manifest_path: &Path) -> String {
+    let root = workspace_manifest_path.parent().unwrap_or(Path::new("."));
+    let package_name = std::fs::read_to_string(workspace_manifest_path)
+        .ok()
+        .and_then(|s| s.parse::<toml::Table>().ok())
+        .and_then(|t| {
+            let name = t.get("package")?.get("name")?.as_str()?;
+            Some(name.to_owned())
+        });
+    let name = package_name
+        .or_else(|| git_repo_name(root))
+        .or_else(|| Some(root.file_name()?.to_str()?.to_owned()))
+        .unwrap_or_else(|| "default".to_owned());
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The directory name of the git repository containing `dir`, resolving a
+/// linked worktree to its main repository.
+fn git_repo_name(dir: &Path) -> Option<String> {
+    let dir = std::fs::canonicalize(dir).ok()?;
+    for ancestor in dir.ancestors() {
+        let dot_git = ancestor.join(".git");
+        let Ok(meta) = std::fs::metadata(&dot_git) else {
+            continue;
+        };
+        let repo = if meta.is_dir() {
+            ancestor.to_owned()
+        } else {
+            // A linked worktree: `.git` is a file with `gitdir: <common>/worktrees/<name>`,
+            // and `<gitdir>/commondir` points back at the main `.git`.
+            let contents = std::fs::read_to_string(&dot_git).ok()?;
+            let gitdir = contents.strip_prefix("gitdir:")?.trim();
+            let gitdir = ancestor.join(gitdir);
+            let common = std::fs::read_to_string(gitdir.join("commondir"))
+                .map(|c| gitdir.join(c.trim()))
+                .unwrap_or_else(|_| gitdir.join("../.."));
+            std::fs::canonicalize(common).ok()?.parent()?.to_owned()
+        };
+        return Some(repo.file_name()?.to_str()?.to_owned());
+    }
+    None
 }
 
 pub fn homedir(cwd: &Path) -> Option<PathBuf> {

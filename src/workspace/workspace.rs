@@ -1,5 +1,5 @@
 use crate::util::data_structures::{HashMap, HashSet, IndexSet};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,9 @@ pub struct Workspace<'gctx> {
     /// Shared build directory for intermediate build artifacts.
     /// This directory may be shared between multiple workspaces.
     build_dir: Option<Filesystem>,
+
+    /// See [`Workspace::shared_build_dir_root`].
+    shared_build_dir_root: OnceCell<Option<PathBuf>>,
 
     /// List of members in this workspace with a listing of all their manifest
     /// paths. The packages themselves can be looked up through the `packages`
@@ -252,6 +255,7 @@ impl<'gctx> Workspace<'gctx> {
             root_manifest: None,
             target_dir: None,
             build_dir: None,
+            shared_build_dir_root: OnceCell::new(),
             members: IndexSet::default(),
             member_ids: HashSet::default(),
             default_members: Vec::new(),
@@ -506,8 +510,35 @@ impl<'gctx> Workspace<'gctx> {
                 .custom_build_dir(&default, self.root_manifest())
                 .expect("template is correct")
         } else {
-            self.default_target_dir()
+            // Checkouts of the same project (e.g. many `git worktree`s) share
+            // one build-dir so that dependencies are built once.
+            let default = ConfigRelativePath::new(
+                "{cargo-cache-home}/targets/{workspace-name}"
+                    .to_owned()
+                    .into(),
+            );
+            self.gctx()
+                .custom_build_dir(&default, self.root_manifest())
+                .expect("template is correct")
         }
+    }
+
+    /// The canonical workspace root, if the build-dir lives outside of it and
+    /// so may be shared with other workspaces.
+    ///
+    /// Packages from path sources then mix this into their metadata hash: the
+    /// same relative path in two checkouts may hold different sources, and the
+    /// default mtime-based freshness check could not tell them apart.
+    /// Registry and git packages are immutable and stay shared.
+    pub fn shared_build_dir_root(&self) -> Option<&Path> {
+        self.shared_build_dir_root
+            .get_or_init(|| {
+                let root = std::fs::canonicalize(self.root()).ok()?;
+                let build_dir = self.build_dir().into_path_unlocked();
+                let build_dir = std::fs::canonicalize(&build_dir).unwrap_or(build_dir);
+                (!build_dir.starts_with(&root)).then_some(root)
+            })
+            .as_deref()
     }
 
     /// Returns the root `[replace]` section of this workspace.

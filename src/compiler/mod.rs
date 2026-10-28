@@ -31,6 +31,7 @@
 pub mod artifact;
 mod build_config;
 pub(crate) mod build_context;
+mod build_dir_gc;
 pub(crate) mod build_runner;
 mod compilation;
 mod compile_kind;
@@ -864,6 +865,12 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
     base.inherit_jobserver(&build_runner.jobserver);
     build_deps_args(&mut base, build_runner, unit)?;
     add_cap_lints(build_runner.bcx, unit, &mut base);
+    // A nightly rustc can run its frontend on several threads, which helps
+    // most with large crates that otherwise keep a single core busy. Added
+    // before `RUSTFLAGS` so a `-Zthreads` there wins.
+    if let Some(threads) = frontend_threads(build_runner.bcx) {
+        base.arg(format!("-Zthreads={threads}"));
+    }
     if let Some(args) = build_runner.bcx.extra_args_for(unit) {
         base.args(args);
     }
@@ -1325,6 +1332,20 @@ fn add_error_format_and_color(build_runner: &BuildRunner<'_, '_>, cmd: &mut Proc
 }
 
 /// Adds essential rustc flags and environment variables to the command to execute.
+/// Threads for rustc's parallel frontend, when the rustc in use supports it.
+/// `CARGO_RUSTC_THREADS` overrides the default; `1` disables it.
+fn frontend_threads(bcx: &BuildContext<'_, '_>) -> Option<usize> {
+    if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev") {
+        return None;
+    }
+    #[expect(clippy::disallowed_methods, reason = "fork-only knob")]
+    let threads = match std::env::var("CARGO_RUSTC_THREADS") {
+        Ok(n) => n.parse().ok()?,
+        Err(_) => std::thread::available_parallelism().map_or(1, |n| n.get().min(8)),
+    };
+    (threads > 1).then_some(threads)
+}
+
 fn build_base_args(
     build_runner: &BuildRunner<'_, '_>,
     cmd: &mut ProcessBuilder,

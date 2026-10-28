@@ -98,10 +98,10 @@ code { font-family: var(--font-mono); }
 .theme .icon { position: absolute; right: 10px; font-size: 16px; color: var(--color-text-muted); pointer-events: none; }
 
 /* Hero */
-.hero { padding: 72px 0 24px; }
+.hero { padding: 56px 0 24px; }
 .hero-label { font-size: 12px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; color: var(--color-brand); margin: 0 0 16px; }
 .hero h1 { font-size: clamp(2rem, 6vw, 3rem); line-height: 1.1; letter-spacing: -0.02em; }
-.hero p.lead { color: var(--color-text-secondary); font-size: 16px; margin: 20px 0 32px; text-wrap: pretty; }
+.hero p.lead { color: var(--color-text-secondary); font-size: 16px; margin: 16px 0 28px; text-wrap: pretty; }
 
 /* Install */
 .install { background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); }
@@ -163,6 +163,27 @@ section > h2 { font-size: 1.5rem; }
 .nightly { --c: var(--color-brand-soft); --o: var(--color-brand); }
 .stock { --c: var(--color-border-strong); }
 
+/* Proof card: the screenshot-sized summary under the headline. */
+.proof { background: var(--color-surface); box-shadow: 0 0 0 1px var(--t-ring); padding: 20px 24px 22px; margin: 0 0 24px; }
+.proof-title { margin: 0 0 16px; font-size: 13px; color: var(--color-text-secondary); }
+.proof-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px 40px; }
+.stat-label { font-size: 13px; color: var(--color-text-secondary); margin: 0; }
+.stat-big { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 2px 0 12px; }
+.stat-big strong { font: 600 clamp(2.5rem, 7vw, 3.5rem)/1 var(--font-sans); letter-spacing: -0.03em; color: var(--color-brand); font-variant-numeric: tabular-nums; }
+.stat-big span { font-size: 14px; color: var(--color-text-secondary); }
+.mini { display: grid; grid-template-columns: 3.5rem 1fr; gap: 6px 10px; align-items: center; font-size: 12px; color: var(--color-text-muted); }
+.mini .track { height: 10px; }
+.mini .val { height: 10px; font-size: 12px; color: var(--color-text-secondary); font-weight: 400; }
+
+/* Growth charts: cumulative cost after each worktree. */
+.growth { display: grid; grid-template-columns: 1fr 1fr; gap: 32px 40px; margin-top: 8px; }
+.growth h3 { font-size: 1.05rem; margin-bottom: 12px; }
+.cols { display: grid; grid-template-columns: repeat(var(--n), 1fr); gap: 12px; height: 180px; align-items: end; border-bottom: 1px solid var(--color-border-strong); }
+.col { display: flex; align-items: end; justify-content: center; gap: 3px; height: 100%; }
+.col .b { width: 40%; max-width: 22px; background: var(--c); position: relative; }
+.h3-val { font: 400 13px var(--font-mono); color: var(--color-text-secondary); margin-left: 8px; }
+.axis { display: grid; grid-template-columns: repeat(var(--n), 1fr); gap: 12px; font-size: 12px; color: var(--color-text-muted); text-align: center; margin-top: 6px; }
+
 /* Changes */
 .changes { max-width: var(--measure); margin: 0; padding: 0 0 0 1.25em; list-style: square; }
 .changes li { margin: 0 0 16px; color: var(--color-text-secondary); font-size: 15px; }
@@ -181,6 +202,8 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
   .bar .hide-sm { display: none; }
   .hero { padding-top: 48px; }
   .row { grid-template-columns: 6.5rem 1fr; }
+  .proof-grid, .growth { grid-template-columns: 1fr; }
+  .proof { padding: 16px; }
 }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
 </style>
@@ -206,7 +229,23 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
   <div class="hero">
     <p class="hero-label">Drop-in Cargo fork</p>
     <h1>Cargo that cleans up after itself</h1>
-    <p class="lead">Every git worktree of a project shares one build directory, which stays under a size limit on its own. Dev builds write less debug info. There is nothing to configure.</p>
+    <p class="lead">Every git worktree of a project shares one build directory, which stays under a size limit on its own. There is nothing to configure.</p>
+
+    <div class="proof" aria-labelledby="proof-title">
+      <p class="proof-title" id="proof-title"></p>
+      <div class="proof-grid">
+        <div>
+          <p class="stat-label">Disk used</p>
+          <p class="stat-big"><strong id="disk-fork"></strong><span id="disk-cmp"></span></p>
+          <div class="mini" id="disk-mini"></div>
+        </div>
+        <div>
+          <p class="stat-label">Build time</p>
+          <p class="stat-big"><strong id="time-fork"></strong><span id="time-cmp"></span></p>
+          <div class="mini" id="time-mini"></div>
+        </div>
+      </div>
+    </div>
 
     <div class="install">
       <div class="tabs" role="tablist" aria-label="Platform">
@@ -227,13 +266,17 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
   </div>
 
   <section id="measured">
-    <h2>Measured</h2>
+    <h2>Every new worktree costs less</h2>
     <p class="section-desc" id="setup"></p>
     <ul class="legend">
       <li><span class="swatch stock"></span>Cargo</li>
-      <li><span class="swatch fork"></span>This fork, stable Rust</li>
-      <li><span class="swatch nightly"></span>This fork, nightly Rust</li>
+      <li><span class="swatch fork"></span>This fork</li>
     </ul>
+    <div class="growth">
+      <div><h3>Total disk <span class="h3-val" id="val-disk"></span></h3><div class="cols" id="grow-disk"></div><div class="axis" id="axis-disk"></div></div>
+      <div><h3>Total build time <span class="h3-val" id="val-time"></span></h3><div class="cols" id="grow-time"></div><div class="axis" id="axis-time"></div></div>
+    </div>
+    <p class="section-desc" style="margin-top:24px">Each worktree is a fresh checkout building one binary. Cargo gives every worktree its own <code>target</code> directory and compiles all dependencies again. The fork compiles them once and reuses them, so later worktrees only build the workspace crates.</p>
     <div class="metrics" id="metrics"></div>
   </section>
 
@@ -274,23 +317,65 @@ enabled = true</pre>
 
 <script>
 const DATA = {
-  setup: "nsh, a 525-crate workspace, dev build of one binary on an 8-core Apple Silicon Mac. One run each, build caches such as sccache off, so expect some noise.",
+  setup: "nsh, a 525-crate workspace, dev build of one binary per worktree on an 8-core Apple Silicon Mac. One run each, compiler caches such as sccache off.",
+  // Per worktree, in build order: [build seconds, total GB on disk afterwards].
+  worktrees: {
+    stock: [[272.9, 6.6], [287.4, 13.2], [285.6, 19.8], [277.2, 26.4], [277.4, 33.0]],
+    fork: [[233.9, 3.9], [88.9, 6.5], [91.4, 9.1], [87.5, 11.7], [88.7, 14.3]],
+  },
   metrics: [
-    { title: "First build", note: "Empty build directory.", unit: "s",
-      rows: [["Cargo", "stock", 267], ["Fork", "fork", 228]] },
-    { title: "Build directory after the first build", note: "Mostly debug info that dependencies no longer carry.", unit: " GB",
-      rows: [["Cargo", "stock", 6.6], ["Fork", "fork", 3.6]] },
-    { title: "Build in a new git worktree", note: "Cargo gives each worktree its own target directory, so this equals its first build. The fork reuses the dependencies and builds only the workspace crates.", unit: "s",
-      rows: [["Cargo", "stock", 267], ["Fork", "fork", 95.5]] },
-    { title: "Disk for two worktrees", note: "Main checkout plus one worktree, both built. Cargo's figure is twice its first build.", unit: " GB",
-      rows: [["Cargo", "stock", 13.2], ["Fork", "fork", 6.8]] },
-    { title: "Rebuild after editing a core crate", note: "Touch nsh-core, which most of the workspace depends on. Neither fork setting makes this faster here.", unit: "s",
+    { title: "One worktree, first build", note: "Empty build directory. Most of the difference is debug info that dependencies no longer carry.", unit: "s",
+      rows: [["Cargo", "stock", 272.9], ["Fork", "fork", 233.9]] },
+    { title: "Rebuild after editing a core crate", note: "Touch nsh-core, which most of the workspace depends on. The fork does not make this faster, on stable or with Cranelift on nightly.", unit: "s",
       rows: [["Cargo", "stock", 19.1], ["Fork", "fork", 19.9], ["Fork, nightly", "nightly", 21.4]] },
   ],
 };
 
-document.getElementById("setup").textContent = DATA.setup;
-const host = document.getElementById("metrics");
+const $ = id => document.getElementById(id);
+const fmtMin = s => `${(s / 60).toFixed(1)} min`;
+const fmtGB = g => `${g.toFixed(1)} GB`;
+const W = DATA.worktrees, n = W.stock.length;
+const total = (rows, i) => rows.slice(0, i + 1).reduce((a, r) => a + r[0], 0);
+const stockTime = total(W.stock, n - 1), forkTime = total(W.fork, n - 1);
+const stockDisk = W.stock[n - 1][1], forkDisk = W.fork[n - 1][1];
+
+$("proof-title").textContent = `${n} git worktrees of a 525-crate Rust workspace, each built once. Measured.`;
+$("disk-fork").textContent = fmtGB(forkDisk);
+$("disk-cmp").textContent = `vs ${fmtGB(stockDisk)} with Cargo, ${(stockDisk / forkDisk).toFixed(1)}× less`;
+$("time-fork").textContent = fmtMin(forkTime);
+$("time-cmp").textContent = `vs ${fmtMin(stockTime)} with Cargo, ${(stockTime / forkTime).toFixed(1)}× faster`;
+
+function bars(el, rows, fmt) {
+  const max = Math.max(...rows.map(r => r[2]));
+  for (const [who, kind, v] of rows) {
+    const pct = (v / max) * 70;
+    el.insertAdjacentHTML("beforeend", `<span>${who}</span><div class="track"><div class="fill ${kind}" style="width:${pct}%"></div><span class="val" style="left:${pct}%">${fmt(v)}</span></div>`);
+  }
+}
+bars($("disk-mini"), [["Cargo", "stock", stockDisk], ["Fork", "fork", forkDisk]], fmtGB);
+bars($("time-mini"), [["Cargo", "stock", stockTime], ["Fork", "fork", forkTime]], fmtMin);
+
+function growth(el, axis, value, fmt) {
+  el.style.setProperty("--n", n); axis.style.setProperty("--n", n);
+  const max = value(W.stock, n - 1);
+  for (let i = 0; i < n; i++) {
+    const col = document.createElement("div");
+    col.className = "col";
+    for (const [rows, kind] of [[W.stock, "stock"], [W.fork, "fork"]]) {
+      const v = value(rows, i);
+      col.insertAdjacentHTML("beforeend", `<div class="b ${kind}" style="height:${(v / max) * 100}%" title="${fmt(v)}"></div>`);
+    }
+    el.append(col);
+    axis.insertAdjacentHTML("beforeend", `<span>${i + 1}</span>`);
+  }
+}
+growth($("grow-disk"), $("axis-disk"), (rows, i) => rows[i][1], fmtGB);
+$("val-disk").textContent = `${fmtGB(stockDisk)} → ${fmtGB(forkDisk)}`;
+$("val-time").textContent = `${fmtMin(stockTime)} → ${fmtMin(forkTime)}`;
+growth($("grow-time"), $("axis-time"), total, fmtMin);
+
+$("setup").textContent = DATA.setup;
+const host = $("metrics");
 for (const m of DATA.metrics) {
   const max = Math.max(...m.rows.map(r => r[2]));
   const el = document.createElement("div");

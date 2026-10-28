@@ -26,21 +26,30 @@ reinstalls the proxy, so rerun the installer after it.
 ## Results
 
 [nsh](https://github.com/longbridge/nsh), a 525-crate workspace, dev build of
-one binary on an 8-core Apple Silicon Mac. One run each with no compiler
-cache, so expect some noise:
+one binary on an 8-core Apple Silicon Mac. Five fresh git worktrees, built one
+after another. One run each with no compiler cache, so expect some noise:
 
-| | Cargo | This fork |
+| Worktree | Cargo | Disk, all worktrees | This fork | Disk, all worktrees |
+|---|---:|---:|---:|---:|
+| 1 | 272.9 s | 6.6 GB | 233.9 s | 3.9 GB |
+| 2 | 287.4 s | 13.2 GB | 88.9 s | 6.5 GB |
+| 3 | 285.6 s | 19.8 GB | 91.4 s | 9.1 GB |
+| 4 | 277.2 s | 26.4 GB | 87.5 s | 11.7 GB |
+| 5 | 277.4 s | 33.0 GB | 88.7 s | 14.3 GB |
+| **Total** | **23.3 min** | **33.0 GB** | **9.8 min** | **14.3 GB** |
+
+Cargo compiles every dependency again in each worktree. The fork compiles them
+once; each later worktree only builds its own workspace crates, about 90 s and
+2.6 GB. The shared build directory stays under its size limit, 10 GiB or twice
+the last build, whichever is larger.
+
+| Rebuild after editing a core crate | Cargo | This fork |
 |---|---:|---:|
-| First build | 267 s | 228 s |
-| Build directory after the first build | 6.6 GB | 3.6 GB |
-| Build in a new git worktree | 267 s (same as a first build) | 95.5 s |
-| Disk for two built worktrees | 13.2 GB (twice the first build) | 6.8 GB |
-| Rebuild after editing a core crate, stable | 19.1 s | 19.9 s |
-| Rebuild after editing a core crate, nightly | | 21.4 s |
-| Build directory over time | grows until `cargo clean` | capped, 10 GiB by default |
+| Stable | 19.1 s | 19.9 s |
+| Nightly, Cranelift | | 21.4 s |
 
-The gains are in disk and in new worktrees. Rebuilding after an edit is not
-faster on this workspace, on stable or with Cranelift on nightly.
+Rebuilding after an edit is not faster on this workspace, on stable or with
+Cranelift on nightly.
 
 ## What changes
 

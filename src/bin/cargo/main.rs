@@ -16,6 +16,7 @@ use crate::command_prelude::*;
 
 fn main() {
     let _guard = setup_logger();
+    raise_fd_limit();
     pin_rustup_toolchain();
 
     let mut gctx = match GlobalContext::default() {
@@ -389,6 +390,46 @@ fn init_git() {
             .expect("set_verify_owner_validation should never fail");
     }
 }
+
+/// Raises the soft limit on open files to the hard limit.
+///
+/// Fine-grained locking keeps a lock file open for every build unit until the
+/// build ends, so a large workspace exceeds macOS's default soft limit of 256.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    // SAFETY: plain libc calls on locals.
+    unsafe {
+        let mut limit: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return;
+        }
+        let mut wanted = limit.rlim_max;
+        // macOS rejects a soft limit above `kern.maxfilesperproc`.
+        #[cfg(target_os = "macos")]
+        {
+            let mut max: libc::c_int = 0;
+            let mut size = std::mem::size_of::<libc::c_int>();
+            if libc::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&raw mut max).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            ) == 0
+                && max > 0
+            {
+                wanted = wanted.min(max as libc::rlim_t);
+            }
+        }
+        if wanted > limit.rlim_cur {
+            limit.rlim_cur = wanted;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
 
 /// Pins the toolchain rustup picks for this directory, as the rustup `cargo`
 /// proxy does, when this Cargo is run directly instead of through the proxy.

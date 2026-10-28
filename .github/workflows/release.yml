@@ -23,9 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          # Separate macOS pools: the arm64 pool is often short of capacity.
+          - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-15
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           # The oldest supported runners, so the binary needs an older glibc.
           - os: ubuntu-22.04

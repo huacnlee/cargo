@@ -86,10 +86,15 @@ code { font-family: var(--font-mono); }
 .bar-name { font-weight: 600; text-decoration: none; margin-right: auto; }
 .bar-name span { color: var(--color-text-muted); font-weight: 400; }
 .bar a:not(.bar-name) { color: var(--color-text-secondary); }
+.theme { position: relative; display: inline-flex; align-items: center; }
 .theme-select {
+  appearance: none; -webkit-appearance: none; cursor: pointer;
   font: 500 13px var(--font-mono); color: var(--color-text); background: var(--color-surface);
-  border: 1px solid var(--color-border-strong); height: 32px; padding: 0 8px;
+  border: 1px solid var(--color-border-strong); height: 32px; padding: 0 36px 0 12px;
+  transition: background 150ms ease-out, border-color 150ms ease-out;
 }
+.theme-select:hover { background: var(--color-surface-2); }
+.theme .icon { position: absolute; right: 10px; font-size: 16px; color: var(--color-text-muted); pointer-events: none; }
 
 /* Hero */
 .hero { padding: 72px 0 24px; }
@@ -111,7 +116,7 @@ code { font-family: var(--font-mono); }
 .cmd pre { flex: 1; min-width: 0; margin: 0; overflow-x: auto; font-size: 14px; }
 .cmd .prompt { color: var(--color-text-muted); user-select: none; }
 @font-face {
-  /* Three Material Design glyphs subset from JetBrainsMono Nerd Font. */
+  /* Four Material Design glyphs subset from JetBrainsMono Nerd Font. */
   font-family: "Icons"; src: url("icons.woff2") format("woff2"); font-display: block;
 }
 .icon { font-family: "Icons"; font-style: normal; font-size: 18px; line-height: 1; }
@@ -185,11 +190,14 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
     <a class="bar-name" href="./"><span>huacnlee/</span>cargo</a>
     <a class="hide-sm" href="https://github.com/huacnlee/cargo">Source</a>
     <a href="https://github.com/huacnlee/cargo/releases">Releases</a>
+    <label class="theme">
     <select class="theme-select" id="theme" aria-label="Theme">
       <option value="tokyo-night">Tokyo Night</option>
       <option value="catppuccin">Catppuccin</option>
       <option value="flexoki-light">Flexoki Light</option>
     </select>
+    <i class="icon" aria-hidden="true">󰅀</i>
+    </label>
   </div>
 </header>
 

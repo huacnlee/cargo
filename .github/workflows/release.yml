@@ -122,7 +122,10 @@ jobs:
             tar -czf "dist/$name.tar.gz" -C stage cargo
             asset="$name.tar.gz"
           fi
-          if [ "$RELEASE_TARGET" != x86_64-apple-darwin ]; then
+          # aarch64-apple-darwin is cross-compiled and cannot run here.
+          if [ "$RELEASE_TARGET" = aarch64-apple-darwin ]; then
+            file stage/cargo | grep -q arm64
+          else
             "stage/cargo$([ "$RUNNER_OS" = Windows ] && echo .exe)" --version
           fi
           cd dist

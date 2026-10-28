@@ -50,6 +50,9 @@ impl fmt::Display for VersionInfo {
     }
 }
 
+/// Where this fork is published.
+const FORK_URL: &str = "https://huacnlee.github.io/cargo/";
+
 /// Returns information about cargo's version.
 pub fn version() -> VersionInfo {
     macro_rules! option_env_str {
@@ -87,7 +90,14 @@ pub fn version() -> VersionInfo {
         commit_hash,
         commit_date: option_env_str!("CARGO_COMMIT_DATE").unwrap(),
     });
-    let description = option_env_str!("CFG_VER_DESCRIPTION");
+    // Name the fork, and its release when CI sets one, so `cargo -V` tells it
+    // apart from the rustup cargo while `release:` still matches rustc.
+    let description = option_env_str!("CFG_VER_DESCRIPTION").or_else(|| {
+        Some(match option_env!("CARGO_FORK_RELEASE") {
+            Some(release) => format!("huacnlee/cargo {release}, {FORK_URL}"),
+            None => format!("huacnlee/cargo, {FORK_URL}"),
+        })
+    });
 
     VersionInfo {
         version,

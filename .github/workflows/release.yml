@@ -103,6 +103,8 @@ jobs:
         run: cargo test --locked --lib build_dir_gc
 
       - name: Build release
+        env:
+          CARGO_FORK_RELEASE: ${{ steps.version.outputs.version }}
         # Statically link OpenSSL, curl and libgit2, as rust-lang ships cargo.
         run: cargo build --locked --release --bin cargo --features all-static --target ${{ matrix.target }}
 

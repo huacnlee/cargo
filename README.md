@@ -23,6 +23,13 @@ This replaces `~/.cargo/bin/cargo` and keeps the rustup proxy as
 toolchain, the installer adds its Cranelift component. `rustup self update`
 reinstalls the proxy, so rerun the installer after it.
 
+Check which cargo is active:
+
+```console
+$ cargo -V
+cargo 1.101.0 (ea4e34c28 2026-10-29) (huacnlee/cargo 0.102.0-1, https://huacnlee.github.io/cargo/)
+```
+
 ## Results
 
 [nsh](https://github.com/longbridge/nsh), a 525-crate workspace, dev build of

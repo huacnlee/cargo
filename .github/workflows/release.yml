@@ -23,8 +23,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Separate macOS pools: the arm64 pool is often short of capacity.
-          - os: macos-14
+          # GitHub's arm64 macOS pools are often short of capacity, so both
+          # macOS targets build on Intel; aarch64 is cross-compiled.
+          - os: macos-15-intel
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
@@ -98,7 +99,7 @@ jobs:
           }
 
       - name: Test build-dir GC
-        if: matrix.target != 'x86_64-apple-darwin'
+        if: matrix.target != 'aarch64-apple-darwin'
         run: cargo test --locked --lib build_dir_gc
 
       - name: Build release

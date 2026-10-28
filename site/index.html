@@ -80,7 +80,7 @@ code { font-family: var(--font-mono); }
   position: sticky; top: 0; z-index: 100; height: var(--nav-h); padding-top: env(safe-area-inset-top);
   background: var(--color-bg); border-bottom: 1px solid var(--color-border);
 }
-.bar-inner, main, footer { max-width: 69rem; margin: 0 auto; padding-inline: 1rem; }
+.bar-inner, main, footer { max-width: 56rem; margin: 0 auto; padding-inline: 1rem; }
 @media (min-width: 40rem) { .bar-inner, main, footer { padding-inline: 1.5rem; } }
 .bar-inner { height: 3.5rem; display: flex; align-items: center; gap: 24px; font-size: 14px; }
 .bar-name { font-weight: 600; text-decoration: none; margin-right: auto; }
@@ -92,13 +92,13 @@ code { font-family: var(--font-mono); }
 }
 
 /* Hero */
-.hero { padding: 72px 0 24px; max-width: var(--measure); }
+.hero { padding: 72px 0 24px; }
 .hero-label { font-size: 12px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; color: var(--color-brand); margin: 0 0 16px; }
 .hero h1 { font-size: clamp(2rem, 6vw, 3rem); line-height: 1.1; letter-spacing: -0.02em; }
 .hero p.lead { color: var(--color-text-secondary); font-size: 16px; margin: 20px 0 32px; text-wrap: pretty; }
 
 /* Install */
-.install { background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); max-width: var(--measure); }
+.install { background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); }
 .tabs { display: flex; border-bottom: 1px solid var(--color-border); }
 .tab {
   font: 500 13px var(--font-mono); color: var(--color-text-muted); background: none; border: 0;
@@ -134,7 +134,7 @@ section > h2 { font-size: 1.5rem; }
 
 /* Terminal demonstration */
 .term {
-  background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); margin: 0; max-width: var(--measure);
+  background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); margin: 0;
   padding: 1em 1.25em; overflow-x: auto; font-size: 13px; line-height: 1.7; color: var(--color-text-secondary);
 }
 .term .prompt { color: var(--color-text-muted); }
@@ -145,7 +145,6 @@ section > h2 { font-size: 1.5rem; }
 .legend { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; color: var(--color-text-secondary); margin: 0 0 8px; padding: 0; list-style: none; }
 .legend li { display: flex; align-items: center; gap: 8px; }
 .swatch { width: 12px; height: 12px; background: var(--c); box-shadow: inset 0 0 0 1px var(--o, transparent); }
-.metrics { max-width: 56rem; }
 .metric { padding: 20px 0; border-top: 1px solid var(--color-border); }
 .metric h3 { font-size: 1.05rem; }
 .metric .note { color: var(--color-text-muted); font-size: 13px; margin: 2px 0 12px; }
@@ -163,7 +162,7 @@ section > h2 { font-size: 1.5rem; }
 .changes li { margin: 0 0 16px; color: var(--color-text-secondary); font-size: 15px; }
 .changes li::marker { color: var(--color-text-muted); }
 .changes strong { color: var(--color-text); font-weight: 600; }
-details { max-width: var(--measure); margin-top: 24px; border-top: 1px solid var(--color-border); padding-top: 16px; }
+details { margin-top: 24px; border-top: 1px solid var(--color-border); padding-top: 16px; }
 summary { cursor: pointer; color: var(--color-text-secondary); font-size: 14px; }
 details .term { margin-top: 12px; }
 details p { color: var(--color-text-secondary); font-size: 14px; }

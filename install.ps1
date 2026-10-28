@@ -1,5 +1,5 @@
 # Install huacnlee/cargo in place of the rustup `cargo` proxy for the current Windows user.
-#   irm https://raw.githubusercontent.com/huacnlee/cargo/HEAD/install.ps1 | iex
+#   irm https://huacnlee.github.io/cargo/install.ps1 | iex
 [CmdletBinding()]
 param(
     [string]$Version = 'latest',
@@ -56,6 +56,12 @@ try {
     Copy-Item -LiteralPath $binary -Destination $target -Force
     Write-Host "Installed $target"
     if (Test-Path -LiteralPath $backup) { Write-Host "Previous cargo kept as $backup (restore with -Uninstall)." }
+    # Nightly builds use Cranelift for local crates; it ships as a component.
+    if ((Get-Command rustup -ErrorAction SilentlyContinue) -and (rustup toolchain list | Select-String '^nightly')) {
+        Write-Host 'Adding the Cranelift backend to the nightly toolchain…'
+        rustup component add rustc-codegen-cranelift-preview --toolchain nightly *> $null
+        if ($LASTEXITCODE -ne 0) { Write-Host 'Cranelift is not available for this nightly; nightly builds use LLVM.' }
+    }
     Write-Host 'Note: `rustup self update` reinstalls its proxies; rerun this script afterwards.'
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

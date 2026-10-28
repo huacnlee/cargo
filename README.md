@@ -1,45 +1,78 @@
 # huacnlee/cargo
 
-A fork of Cargo tuned for fast local builds and a bounded disk footprint,
-especially when many git worktrees (e.g. AI agents) build the same project.
+A drop-in Cargo fork: every git worktree of a project shares one build
+directory, which stays under a size limit on its own. Nothing to configure.
+
+https://huacnlee.github.io/cargo/
 
 ## Install
 
-Replaces `~/.cargo/bin/cargo` (the rustup proxy is kept as `cargo.rustup`):
-
 ```sh
-curl -fsSL https://raw.githubusercontent.com/huacnlee/cargo/HEAD/install.sh | sh
-# Windows: irm https://raw.githubusercontent.com/huacnlee/cargo/HEAD/install.ps1 | iex
-# Undo:    sh install.sh --uninstall
+curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh
 ```
 
-`cargo +nightly ...` and `rust-toolchain.toml` keep working through rustup.
-`rustup self update` reinstalls the proxy; rerun the installer afterwards.
+Windows (PowerShell):
+
+```powershell
+irm https://huacnlee.github.io/cargo/install.ps1 | iex
+```
+
+This replaces `~/.cargo/bin/cargo` and keeps the rustup proxy as
+`cargo.rustup`; run the script with `--uninstall` to put it back.
+`cargo +nightly` and `rust-toolchain.toml` keep working. If you have a nightly
+toolchain, the installer adds its Cranelift component. `rustup self update`
+reinstalls the proxy, so rerun the installer after it.
+
+## Results
+
+[nsh](https://github.com/longbridge/nsh), a 525-crate workspace, dev build of
+one binary on an 8-core Apple Silicon Mac. One run each with no compiler
+cache, so expect some noise:
+
+| | Cargo | This fork |
+|---|---:|---:|
+| First build | 267 s | 228 s |
+| Build directory after the first build | 6.6 GB | 3.6 GB |
+| Build in a new git worktree | 267 s (same as a first build) | 95.5 s |
+| Disk for two built worktrees | 13.2 GB (twice the first build) | 6.8 GB |
+| Rebuild after editing a core crate, stable | 19.1 s | 19.9 s |
+| Rebuild after editing a core crate, nightly | | 21.4 s |
+| Build directory over time | grows until `cargo clean` | capped, 10 GiB by default |
+
+The gains are in disk and in new worktrees. Rebuilding after an edit is not
+faster on this workspace, on stable or with Cranelift on nightly.
 
 ## What changes
 
-- **Shared build-dir**: intermediate artifacts live in
-  `~/.cargo/targets/<workspace-name>/` (name from the root package, else the git
-  repo, worktree-aware). Worktrees of a repo reuse registry/git dependencies;
-  local crates stay per checkout. Final binaries still land in `./target`.
-- **Automatic GC**: after each build, at most once an hour, unused build units
-  (7 days), stale incremental sessions and old-layout leftovers are removed,
-  then least-recently-used units until the build-dir fits `max-size`.
-- **Fine-grained locking** on by default, so worktrees build concurrently.
-- **Lighter dev debuginfo**: `line-tables-only` for workspace members, none for
-  dependencies, unless `debug` is set in a profile.
-- **On nightly**: Cranelift for local crates in `cargo build` (when the
-  `rustc-codegen-cranelift-preview` component is installed; `CARGO_DEV_CRANELIFT=0`
-  to disable) and a parallel front end (`-Zthreads`, `CARGO_RUSTC_THREADS=1` to disable).
+- **One build directory per project.** Intermediate files go to
+  `~/.cargo/targets/<name>-<hash>/`; the hash comes from the repository's main
+  `.git` directory, so every worktree lands there wherever it is created.
+  Worktrees reuse registry and git dependencies and build only their own
+  crates. Binaries still appear in `./target`.
+- **It cleans itself.** After a build, at most once an hour, units unused for
+  7 days, stale incremental caches and old-layout leftovers are removed, then
+  the least recently used units until the project fits the larger of 10 GiB
+  and twice the last build. Units used in the last hour are never removed.
+- **Worktrees build at the same time.** Fine-grained locking is on.
+- **Less debug info in dev builds.** Line tables for workspace members, none
+  for dependencies. A `debug` setting in your profile still wins.
+- **Cranelift on nightly.** `cargo build` compiles local crates with Cranelift
+  and runs the front end on up to 8 threads (`-Zthreads`). Tests and release
+  builds keep LLVM.
+
+All of these are defaults. To change one:
 
 ```toml
 # ~/.cargo/config.toml
 [build.gc]
-max-size = "auto"     # max(10 GiB, 2x the last build); or "15 GiB" / "none"
+max-size = "auto"     # or "15 GiB", "none"
 max-unused = "7 days"
-frequency = "1 hour"  # or "always" / "never"
+frequency = "1 hour"  # or "always", "never"
 enabled = true
 ```
+
+`CARGO_DEV_CRANELIFT=0` keeps LLVM on nightly; `CARGO_RUSTC_THREADS=1` makes
+the front end single-threaded.
 
 ---
 

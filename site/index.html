@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en" data-theme="tokyo-night">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>huacnlee/cargo</title>
+<meta name="description" content="A drop-in Cargo that shares build output across git worktrees, keeps each project's build directory under a size limit, and needs no configuration.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script>
+  // Apply the saved or system theme before first paint.
+  (() => {
+    let theme = null;
+    try { theme = localStorage.getItem("theme"); } catch {}
+    if (!theme) theme = matchMedia("(prefers-color-scheme: light)").matches ? "flexoki-light" : "tokyo-night";
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
+<style>
+/* Runtime theme values: only these change between themes. */
+:root, [data-theme="tokyo-night"] {
+  color-scheme: dark;
+  --t-bg-deep: #13141c; --t-bg: #1a1b26; --t-surface: #1f2230; --t-surface-2: #24283b;
+  --t-border-subtle: #24283b; --t-border-strong: #414868;
+  --t-text: #c0caf5; --t-text-secondary: #a9b1d6; --t-text-muted: #8b93b8;
+  --t-brand: #9ece6a; --t-brand-soft: #9ece6a1f; --t-brand-ink: #0c0e10;
+  --t-selection: #292e42; --t-ring: oklch(1 0 0 / .07); --t-ring-hover: oklch(1 0 0 / .13);
+}
+[data-theme="catppuccin"] {
+  color-scheme: dark;
+  --t-bg-deep: #11111b; --t-bg: #1e1e2e; --t-surface: #232334; --t-surface-2: #313244;
+  --t-border-subtle: #313244; --t-border-strong: #45475a;
+  --t-text: #cdd6f4; --t-text-secondary: #bac2de; --t-text-muted: #9399b2;
+  --t-brand: #89b4fa; --t-brand-soft: #89b4fa1f; --t-brand-ink: #11111b;
+  --t-selection: #45475a; --t-ring: oklch(1 0 0 / .07); --t-ring-hover: oklch(1 0 0 / .13);
+}
+[data-theme="flexoki-light"] {
+  color-scheme: light;
+  --t-bg-deep: #f2f0e5; --t-bg: #fffcf0; --t-surface: #fffcf0; --t-surface-2: #e6e4d9;
+  --t-border-subtle: #e6e4d9; --t-border-strong: #b7b5ac;
+  --t-text: #100f0f; --t-text-secondary: #403e3c; --t-text-muted: #6f6e69;
+  --t-brand: #205ea6; --t-brand-soft: #205ea61f; --t-brand-ink: #fffcf0;
+  --t-selection: #dad8ce; --t-ring: oklch(0 0 0 / .1); --t-ring-hover: oklch(0 0 0 / .18);
+}
+/* Semantic aliases: components only use these. */
+:root {
+  --color-bg-deep: var(--t-bg-deep); --color-bg: var(--t-bg);
+  --color-surface: var(--t-surface); --color-surface-2: var(--t-surface-2);
+  --color-border: var(--t-border-subtle); --color-border-strong: var(--t-border-strong);
+  --color-text: var(--t-text); --color-text-secondary: var(--t-text-secondary); --color-text-muted: var(--t-text-muted);
+  --color-brand: var(--t-brand); --color-brand-soft: var(--t-brand-soft); --color-brand-ink: var(--t-brand-ink);
+  --color-ring: var(--t-brand);
+  --font-mono: "JetBrains Mono", "JetBrainsMono Nerd Font", ui-monospace, monospace;
+  --font-sans: Geist, ui-sans-serif, system-ui, sans-serif;
+  --nav-h: calc(3.5rem + env(safe-area-inset-top));
+  --measure: 48rem;
+}
+.no-transition, .no-transition * { transition: none !important; }
+
+* { box-sizing: border-box; border-radius: 0; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; font-synthesis: none; }
+body {
+  margin: 0; background: var(--color-bg); color: var(--color-text);
+  font: 400 16px/1.65 var(--font-mono);
+}
+::selection { background: var(--t-selection); color: var(--color-text); }
+[id] { scroll-margin-top: var(--nav-h); }
+h1, h2, h3 { font-family: var(--font-sans); font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; margin: 0; color: var(--color-text); }
+a { color: inherit; text-decoration: underline; text-decoration-color: var(--color-border-strong); text-underline-offset: 3px; text-decoration-skip-ink: auto; transition: text-decoration-color 150ms ease-out; }
+a:hover { text-decoration-color: var(--color-brand); }
+:focus-visible { outline: 2px solid var(--color-ring); outline-offset: 2px; }
+button, select, a { touch-action: manipulation; }
+code { font-family: var(--font-mono); }
+:not(pre) > code { font-size: 0.86em; background: var(--color-surface-2); padding: 0.15em 0.4em; }
+
+/* Bar */
+.bar {
+  position: sticky; top: 0; z-index: 100; height: var(--nav-h); padding-top: env(safe-area-inset-top);
+  background: var(--color-bg); border-bottom: 1px solid var(--color-border);
+}
+.bar-inner, main, footer { max-width: 69rem; margin: 0 auto; padding-inline: 1rem; }
+@media (min-width: 40rem) { .bar-inner, main, footer { padding-inline: 1.5rem; } }
+.bar-inner { height: 3.5rem; display: flex; align-items: center; gap: 24px; font-size: 14px; }
+.bar-name { font-weight: 600; text-decoration: none; margin-right: auto; }
+.bar-name span { color: var(--color-text-muted); font-weight: 400; }
+.bar a:not(.bar-name) { color: var(--color-text-secondary); }
+.theme-select {
+  font: 500 13px var(--font-mono); color: var(--color-text); background: var(--color-surface);
+  border: 1px solid var(--color-border-strong); height: 32px; padding: 0 8px;
+}
+
+/* Hero */
+.hero { padding: 72px 0 24px; max-width: var(--measure); }
+.hero-label { font-size: 12px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; color: var(--color-brand); margin: 0 0 16px; }
+.hero h1 { font-size: clamp(2rem, 6vw, 3rem); line-height: 1.1; letter-spacing: -0.02em; }
+.hero p.lead { color: var(--color-text-secondary); font-size: 16px; margin: 20px 0 32px; text-wrap: pretty; }
+
+/* Install */
+.install { background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); max-width: var(--measure); }
+.tabs { display: flex; border-bottom: 1px solid var(--color-border); }
+.tab {
+  font: 500 13px var(--font-mono); color: var(--color-text-muted); background: none; border: 0;
+  height: 40px; padding: 0 16px; cursor: pointer; box-shadow: inset 0 -2px 0 transparent;
+  transition: color 150ms ease-out, box-shadow 150ms ease-out;
+}
+.tab[aria-selected="true"] { color: var(--color-text); box-shadow: inset 0 -2px 0 var(--color-brand); }
+.tab:focus-visible { outline-offset: -2px; }
+.cmd { display: flex; align-items: center; gap: 12px; padding: 16px; }
+.cmd pre { flex: 1; min-width: 0; margin: 0; overflow-x: auto; font-size: 14px; }
+.cmd .prompt { color: var(--color-text-muted); user-select: none; }
+@font-face {
+  /* Three Material Design glyphs subset from JetBrainsMono Nerd Font. */
+  font-family: "Icons"; src: url("icons.woff2") format("woff2"); font-display: block;
+}
+.icon { font-family: "Icons"; font-style: normal; font-size: 18px; line-height: 1; }
+.btn {
+  flex: none; width: 36px; height: 36px; padding: 0; cursor: pointer; border: 0;
+  display: grid; place-items: center;
+  background: var(--color-brand); color: var(--color-brand-ink);
+  transition: background 150ms ease-out, transform 150ms ease-out;
+}
+.btn:hover { background: color-mix(in oklab, var(--color-brand), white 14%); }
+.btn:active { transform: scale(0.96); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.install-note { color: var(--color-text-secondary); font-size: 14px; max-width: var(--measure); margin: 16px 0 0; }
+
+/* Sections */
+section { padding-top: 72px; }
+section > h2 { font-size: 1.5rem; }
+@media (min-width: 40rem) { section > h2 { font-size: 1.75rem; } }
+.section-desc { color: var(--color-text-secondary); font-size: 15px; line-height: 1.7; max-width: var(--measure); margin: 8px 0 24px; text-wrap: pretty; }
+
+/* Terminal demonstration */
+.term {
+  background: var(--color-bg-deep); box-shadow: 0 0 0 1px var(--t-ring); margin: 0; max-width: var(--measure);
+  padding: 1em 1.25em; overflow-x: auto; font-size: 13px; line-height: 1.7; color: var(--color-text-secondary);
+}
+.term .prompt { color: var(--color-text-muted); }
+.term .cmdline { color: var(--color-text); }
+.term .status { color: var(--color-brand); font-weight: 600; }
+
+/* Measurements */
+.legend { display: flex; flex-wrap: wrap; gap: 8px 24px; font-size: 13px; color: var(--color-text-secondary); margin: 0 0 8px; padding: 0; list-style: none; }
+.legend li { display: flex; align-items: center; gap: 8px; }
+.swatch { width: 12px; height: 12px; background: var(--c); box-shadow: inset 0 0 0 1px var(--o, transparent); }
+.metrics { max-width: 56rem; }
+.metric { padding: 20px 0; border-top: 1px solid var(--color-border); }
+.metric h3 { font-size: 1.05rem; }
+.metric .note { color: var(--color-text-muted); font-size: 13px; margin: 2px 0 12px; }
+.row { display: grid; grid-template-columns: 9rem 1fr; gap: 12px; align-items: center; margin: 6px 0; font-size: 13px; }
+.row .who { color: var(--color-text-secondary); }
+.track { position: relative; height: 22px; }
+.fill { height: 100%; background: var(--c); box-shadow: inset 0 0 0 1px var(--o, transparent); }
+.val { position: absolute; top: 0; height: 22px; display: flex; align-items: center; padding-left: 8px; white-space: nowrap; color: var(--color-text); font-weight: 500; }
+.fork { --c: var(--color-brand); }
+.nightly { --c: var(--color-brand-soft); --o: var(--color-brand); }
+.stock { --c: var(--color-border-strong); }
+
+/* Changes */
+.changes { max-width: var(--measure); margin: 0; padding: 0 0 0 1.25em; list-style: square; }
+.changes li { margin: 0 0 16px; color: var(--color-text-secondary); font-size: 15px; }
+.changes li::marker { color: var(--color-text-muted); }
+.changes strong { color: var(--color-text); font-weight: 600; }
+details { max-width: var(--measure); margin-top: 24px; border-top: 1px solid var(--color-border); padding-top: 16px; }
+summary { cursor: pointer; color: var(--color-text-secondary); font-size: 14px; }
+details .term { margin-top: 12px; }
+details p { color: var(--color-text-secondary); font-size: 14px; }
+
+footer { padding-top: 72px; padding-bottom: 48px; font-size: 13px; color: var(--color-text-muted); }
+footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin: 0; }
+
+@media (max-width: 40rem) {
+  .bar-inner { gap: 16px; }
+  .bar .hide-sm { display: none; }
+  .hero { padding-top: 48px; }
+  .row { grid-template-columns: 6.5rem 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="bar-inner">
+    <a class="bar-name" href="./"><span>huacnlee/</span>cargo</a>
+    <a class="hide-sm" href="https://github.com/huacnlee/cargo">Source</a>
+    <a href="https://github.com/huacnlee/cargo/releases">Releases</a>
+    <select class="theme-select" id="theme" aria-label="Theme">
+      <option value="tokyo-night">Tokyo Night</option>
+      <option value="catppuccin">Catppuccin</option>
+      <option value="flexoki-light">Flexoki Light</option>
+    </select>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <p class="hero-label">Drop-in Cargo fork</p>
+    <h1>Cargo that cleans up after itself</h1>
+    <p class="lead">Every git worktree of a project shares one build directory, which stays under a size limit on its own. Dev builds write less debug info. There is nothing to configure.</p>
+
+    <div class="install">
+      <div class="tabs" role="tablist" aria-label="Platform">
+        <button class="tab" role="tab" id="tab-unix" aria-controls="cmd-unix" aria-selected="true">macOS and Linux</button>
+        <button class="tab" role="tab" id="tab-windows" aria-controls="cmd-windows" aria-selected="false" tabindex="-1">Windows</button>
+      </div>
+      <div class="cmd" role="tabpanel" id="cmd-unix" aria-labelledby="tab-unix">
+        <pre><span class="prompt">$ </span><code>curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh</code></pre>
+        <button class="btn" type="button" aria-label="Copy command" title="Copy command"><i class="icon" aria-hidden="true">󰆏</i></button>
+      </div>
+      <div class="cmd" role="tabpanel" id="cmd-windows" aria-labelledby="tab-windows" hidden>
+        <pre><span class="prompt">&gt; </span><code>irm https://huacnlee.github.io/cargo/install.ps1 | iex</code></pre>
+        <button class="btn" type="button" aria-label="Copy command" title="Copy command"><i class="icon" aria-hidden="true">󰆏</i></button>
+      </div>
+    </div>
+    <p class="sr-only" role="status" id="copy-status"></p>
+    <p class="install-note">Installs over <code>~/.cargo/bin/cargo</code> and keeps the rustup proxy as <code>cargo.rustup</code>. <code>cargo +nightly</code> and <code>rust-toolchain.toml</code> keep working. Run the script with <code>--uninstall</code> to put the proxy back.</p>
+  </div>
+
+  <section id="measured">
+    <h2>Measured</h2>
+    <p class="section-desc" id="setup"></p>
+    <ul class="legend">
+      <li><span class="swatch stock"></span>Cargo</li>
+      <li><span class="swatch fork"></span>This fork, stable Rust</li>
+      <li><span class="swatch nightly"></span>This fork, nightly Rust</li>
+    </ul>
+    <div class="metrics" id="metrics"></div>
+  </section>
+
+  <section id="cleanup">
+    <h2>What a cleanup looks like</h2>
+    <p class="section-desc">After a build, at most once an hour, Cargo removes what no checkout has used for a week, then the least recently used units until the project fits. It prints one line when it frees something.</p>
+<pre class="term"><span class="prompt">$ </span><span class="cmdline">cargo build</span>
+    <span class="status">Finished</span> `dev` profile [unoptimized + debuginfo] target(s) in 1.89s
+     <span class="status">Cleaned</span> 680 stale build units, 10.1GiB freed (build.gc)</pre>
+  </section>
+
+  <section id="changes">
+    <h2>What changes</h2>
+    <p class="section-desc">Your projects, <code>Cargo.toml</code> and <code>.cargo/config.toml</code> stay as they are.</p>
+    <ul class="changes">
+      <li><strong>One build directory per project.</strong> Intermediate files go to <code>~/.cargo/targets/&lt;name&gt;-&lt;hash&gt;/</code>, where the hash comes from the repository's <code>.git</code> directory. Every worktree lands there wherever it is created, reuses compiled dependencies, and only builds its own crates. Binaries still appear in <code>./target</code>.</li>
+      <li><strong>A size limit.</strong> The larger of 10 GiB and twice the last build. Units used in the last hour are never removed.</li>
+      <li><strong>Worktrees build at the same time.</strong> Fine-grained locking is on, so parallel agents do not queue on one lock.</li>
+      <li><strong>Less debug info in dev builds.</strong> Line tables for your crates, none for dependencies. Backtraces keep file and line. A <code>debug</code> setting in your profile still wins.</li>
+      <li><strong>Cranelift on nightly.</strong> <code>cargo build</code> compiles your crates with Cranelift and runs the compiler front end on up to 8 threads. Tests and release builds keep LLVM. The installer adds the Cranelift component when you have a nightly toolchain.</li>
+    </ul>
+    <details>
+      <summary>Change a default</summary>
+<pre class="term"><span class="prompt"># ~/.cargo/config.toml</span>
+<span class="cmdline">[build.gc]</span>
+max-size = "auto"      <span class="prompt"># or "15 GiB", "none"</span>
+max-unused = "7 days"
+frequency = "1 hour"   <span class="prompt"># or "always", "never"</span>
+enabled = true</pre>
+      <p>Set <code>CARGO_DEV_CRANELIFT=0</code> to keep LLVM on nightly, and <code>CARGO_RUSTC_THREADS=1</code> for a single-threaded front end.</p>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <p>Based on <a href="https://github.com/rust-lang/cargo">rust-lang/cargo</a>. Not affiliated with the Rust project.</p>
+</footer>
+
+<script>
+const DATA = {
+  setup: "nsh, a 525-crate workspace, dev build of one binary on an 8-core Apple Silicon Mac. One run each, build caches such as sccache off, so expect some noise.",
+  metrics: [
+    { title: "First build", note: "Empty build directory.", unit: "s",
+      rows: [["Cargo", "stock", 267], ["Fork", "fork", 228]] },
+    { title: "Build directory after the first build", note: "Mostly debug info that dependencies no longer carry.", unit: " GB",
+      rows: [["Cargo", "stock", 6.6], ["Fork", "fork", 3.6]] },
+    { title: "Build in a new git worktree", note: "Cargo gives each worktree its own target directory, so this equals its first build. The fork reuses the dependencies and builds only the workspace crates.", unit: "s",
+      rows: [["Cargo", "stock", 267], ["Fork", "fork", 95.5]] },
+    { title: "Disk for two worktrees", note: "Main checkout plus one worktree, both built. Cargo's figure is twice its first build.", unit: " GB",
+      rows: [["Cargo", "stock", 13.2], ["Fork", "fork", 6.8]] },
+    { title: "Rebuild after editing a core crate", note: "Touch nsh-core, which most of the workspace depends on. Neither fork setting makes this faster here.", unit: "s",
+      rows: [["Cargo", "stock", 19.1], ["Fork", "fork", 19.9], ["Fork, nightly", "nightly", 21.4]] },
+  ],
+};
+
+document.getElementById("setup").textContent = DATA.setup;
+const host = document.getElementById("metrics");
+for (const m of DATA.metrics) {
+  const max = Math.max(...m.rows.map(r => r[2]));
+  const el = document.createElement("div");
+  el.className = "metric";
+  el.innerHTML = '<h3></h3><p class="note"></p>';
+  el.querySelector("h3").textContent = m.title;
+  el.querySelector(".note").textContent = m.note;
+  for (const [who, kind, v, label] of m.rows) {
+    const pct = (v / max) * 78;
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<span class="who"></span><div class="track"><div class="fill ${kind}" style="width:${pct}%"></div><span class="val" style="left:${pct}%"></span></div>`;
+    row.querySelector(".who").textContent = who;
+    row.querySelector(".val").textContent = label ?? `${v}${m.unit}`;
+    el.append(row);
+  }
+  host.append(el);
+}
+
+// Theme: swap without animating every color.
+const select = document.getElementById("theme");
+select.value = document.documentElement.dataset.theme;
+select.addEventListener("change", () => {
+  const root = document.documentElement;
+  root.classList.add("no-transition");
+  root.dataset.theme = select.value;
+  try { localStorage.setItem("theme", select.value); } catch {}
+  requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("no-transition")));
+});
+
+// Platform tabs with arrow-key navigation.
+const tabs = [...document.querySelectorAll(".tab")];
+function selectTab(tab) {
+  for (const t of tabs) {
+    const on = t === tab;
+    t.setAttribute("aria-selected", on);
+    t.tabIndex = on ? 0 : -1;
+    document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+  }
+  tab.focus();
+}
+for (const tab of tabs) {
+  tab.addEventListener("click", () => selectTab(tab));
+  tab.addEventListener("keydown", e => {
+    const i = tabs.indexOf(tab);
+    if (e.key === "ArrowRight") selectTab(tabs[(i + 1) % tabs.length]);
+    if (e.key === "ArrowLeft") selectTab(tabs[(i - 1 + tabs.length) % tabs.length]);
+  });
+}
+
+const status = document.getElementById("copy-status");
+for (const btn of document.querySelectorAll(".btn")) {
+  const icon = btn.querySelector(".icon");
+  btn.addEventListener("click", async () => {
+    const text = btn.parentElement.querySelector("code").textContent;
+    let ok = true;
+    try { await navigator.clipboard.writeText(text); } catch { ok = false; }
+    icon.textContent = ok ? "\u{F012C}" : "\u{F0156}";
+    status.textContent = ok ? "Copied" : "Copy failed. Select the command and copy it.";
+    setTimeout(() => { icon.textContent = "\u{F018F}"; status.textContent = ""; }, 1600);
+  });
+}
+</script>
+</body>
+</html>

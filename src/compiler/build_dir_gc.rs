@@ -177,7 +177,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
                 "{} stale build unit{}, {} freed (build.gc)",
                 removed.count,
                 if removed.count == 1 { "" } else { "s" },
-                HumanBytes(removed.bytes),
+                format!("{:.1}", HumanBytes(removed.bytes)),
             ),
         )?;
     }

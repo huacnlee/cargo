@@ -1,0 +1,47 @@
+# Publish site/ plus the installers to https://huacnlee.github.io/cargo/.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ['site/**', 'install.sh', 'install.ps1', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Assemble site
+        run: |
+          sh -n install.sh
+          mkdir -p _site
+          cp -R site/. _site/
+          cp install.sh install.ps1 _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

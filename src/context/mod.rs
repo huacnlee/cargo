@@ -2205,14 +2205,19 @@ fn registry_name(gctx: &GlobalContext, sid: &SourceId) -> CargoResult<Option<Str
     Ok(name)
 }
 
-/// A short name identifying a workspace for `{workspace-name}`, shared by
-/// every checkout of the same project so they can share a build-dir.
+/// A directory name identifying a workspace for `{workspace-name}`, shared by
+/// every checkout of the same project so they can share a build-dir:
+/// `<name>-<hash>`.
 ///
-/// It is the root package's name, else the name of the git repository the
-/// workspace lives in (the main checkout's, for a `git worktree`), else the
-/// name of the workspace directory.
+/// The name is the root package's name, else the name of the git repository
+/// the workspace lives in, else the name of the workspace directory. The hash
+/// keeps same-named projects apart. It comes from the repository's main `.git`
+/// directory, which every `git worktree` points back to wherever it is
+/// created; outside git, from the workspace's path.
 fn workspace_name(workspace_manifest_path: &Path) -> String {
     let root = workspace_manifest_path.parent().unwrap_or(Path::new("."));
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    let git_dir = git_common_dir(&root);
     let package_name = std::fs::read_to_string(workspace_manifest_path)
         .ok()
         .and_then(|s| s.parse::<toml::Table>().ok())
@@ -2221,10 +2226,20 @@ fn workspace_name(workspace_manifest_path: &Path) -> String {
             Some(name.to_owned())
         });
     let name = package_name
-        .or_else(|| git_repo_name(root))
+        .or_else(|| {
+            Some(
+                git_dir
+                    .as_ref()?
+                    .parent()?
+                    .file_name()?
+                    .to_str()?
+                    .to_owned(),
+            )
+        })
         .or_else(|| Some(root.file_name()?.to_str()?.to_owned()))
         .unwrap_or_else(|| "default".to_owned());
-    name.chars()
+    let name: String = name
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
                 c
@@ -2232,32 +2247,30 @@ fn workspace_name(workspace_manifest_path: &Path) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    let identity = git_dir.unwrap_or(root);
+    format!("{name}-{}", &crate::util::hex::short_hash(&identity)[..8])
 }
 
-/// The directory name of the git repository containing `dir`, resolving a
-/// linked worktree to its main repository.
-fn git_repo_name(dir: &Path) -> Option<String> {
-    let dir = std::fs::canonicalize(dir).ok()?;
+/// The main `.git` directory of the repository containing `dir`, resolving a
+/// linked worktree back to it.
+fn git_common_dir(dir: &Path) -> Option<PathBuf> {
     for ancestor in dir.ancestors() {
         let dot_git = ancestor.join(".git");
         let Ok(meta) = std::fs::metadata(&dot_git) else {
             continue;
         };
-        let repo = if meta.is_dir() {
-            ancestor.to_owned()
-        } else {
-            // A linked worktree: `.git` is a file with `gitdir: <common>/worktrees/<name>`,
-            // and `<gitdir>/commondir` points back at the main `.git`.
-            let contents = std::fs::read_to_string(&dot_git).ok()?;
-            let gitdir = contents.strip_prefix("gitdir:")?.trim();
-            let gitdir = ancestor.join(gitdir);
-            let common = std::fs::read_to_string(gitdir.join("commondir"))
-                .map(|c| gitdir.join(c.trim()))
-                .unwrap_or_else(|_| gitdir.join("../.."));
-            std::fs::canonicalize(common).ok()?.parent()?.to_owned()
-        };
-        return Some(repo.file_name()?.to_str()?.to_owned());
+        if meta.is_dir() {
+            return Some(dot_git);
+        }
+        // A linked worktree: `.git` is a file with `gitdir: <common>/worktrees/<name>`,
+        // and `<gitdir>/commondir` points back at the main `.git`.
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let gitdir = ancestor.join(contents.strip_prefix("gitdir:")?.trim());
+        let common = std::fs::read_to_string(gitdir.join("commondir"))
+            .map(|c| gitdir.join(c.trim()))
+            .unwrap_or_else(|_| gitdir.join("../.."));
+        return std::fs::canonicalize(common).ok();
     }
     None
 }

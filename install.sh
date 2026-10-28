@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install huacnlee/cargo in place of the rustup `cargo` proxy. No sudo required.
 #
-#   curl -fsSL https://raw.githubusercontent.com/huacnlee/cargo/HEAD/install.sh | sh
+#   curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh
 #   sh install.sh --uninstall   # put the rustup proxy back
 set -eu
 
@@ -91,6 +91,12 @@ mv -f "$staged" "$target"
 printf 'Installed %s\n' "$target"
 [ -e "$backup" ] && printf 'Previous cargo kept as %s (restore with --uninstall).\n' "$backup"
 if command -v rustup >/dev/null; then
+  # Nightly builds use Cranelift for local crates; it ships as a component.
+  if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+    printf '%s\n' 'Adding the Cranelift backend to the nightly toolchain…'
+    rustup component add rustc-codegen-cranelift-preview --toolchain nightly >/dev/null 2>&1 ||
+      printf '%s\n' 'Cranelift is not available for this nightly; nightly builds use LLVM.'
+  fi
   printf '%s\n' 'Note: `rustup self update` reinstalls its proxies; rerun this script afterwards.'
 else
   printf '%s\n' 'Note: rustup not found; cargo will use the rustc on PATH.'

@@ -365,7 +365,9 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// With the new layout it lives in the unit's own directory, so it is
     /// collected together with the unit and kept as long as the unit is.
     pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
-        if self.ws.gctx().cli_unstable().build_dir_new_layout {
+        if self.ws.gctx().cli_unstable().build_dir_new_layout
+            && !crate::workspace::features::is_fork_defaults_opt_out()
+        {
             self.build_unit_dir(unit).join("incremental")
         } else {
             self.layout(unit.kind)

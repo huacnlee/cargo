@@ -17,7 +17,9 @@ use crate::command_prelude::*;
 fn main() {
     let _guard = setup_logger();
     raise_fd_limit();
-    pin_rustup_toolchain();
+    if !cargo::workspace::features::is_fork_defaults_opt_out() {
+        pin_rustup_toolchain();
+    }
 
     let mut gctx = match GlobalContext::default() {
         Ok(gctx) => gctx,
@@ -403,6 +405,7 @@ fn raise_fd_limit() {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
             return;
         }
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut wanted = limit.rlim_max;
         // macOS rejects a soft limit above `kern.maxfilesperproc`.
         #[cfg(target_os = "macos")]
@@ -459,8 +462,11 @@ fn pin_rustup_toolchain() {
         match status {
             Ok(status) => std::process::exit(status.code().unwrap_or(101)),
             Err(e) => {
-                eprintln!("error: `+{toolchain}` requires rustup: {e}");
-                std::process::exit(101);
+                let mut shell = Shell::new();
+                cargo::exit_with_error(
+                    anyhow::format_err!("`+{toolchain}` requires rustup: {e}").into(),
+                    &mut shell,
+                )
             }
         }
     }

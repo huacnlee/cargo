@@ -1448,6 +1448,9 @@ pub trait TestEnvCommandExt: Sized {
             .env("__CARGO_TEST_DISABLE_GLOBAL_KNOWN_HOST", "1")
             // Set retry sleep to 1 millisecond.
             .env("__CARGO_TEST_FIXED_RETRY_SLEEP_MS", "1")
+            // Test against upstream Cargo's defaults; tests of this fork's
+            // defaults remove it.
+            .env("__CARGO_FORK_DEFAULTS_OPT_OUT", "1")
             // Setting this to a large number helps avoid problems with long
             // paths getting trimmed in snapshot tests.
             //

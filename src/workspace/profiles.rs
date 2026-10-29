@@ -286,7 +286,9 @@ impl Profiles {
     /// intrinsics Cranelift does not fully support.
     pub fn enable_default_dev_codegen_backend(&mut self, gctx: &GlobalContext) -> CargoResult<()> {
         #[expect(clippy::disallowed_methods, reason = "fork-only opt out")]
-        if std::env::var("CARGO_DEV_CRANELIFT").as_deref() == Ok("0") {
+        if std::env::var("CARGO_DEV_CRANELIFT").as_deref() == Ok("0")
+            || crate::workspace::features::is_fork_defaults_opt_out()
+        {
             return Ok(());
         }
         let rustc = gctx.load_global_rustc(None)?;
@@ -548,7 +550,9 @@ impl ProfileMaker {
         // backtraces) and no debuginfo for dependencies: full debuginfo is a
         // large share of build time and of the build-dir's size. An explicit
         // `debug` anywhere below overrides this.
-        if profile.root == ProfileRoot::Debug {
+        if profile.root == ProfileRoot::Debug
+            && !crate::workspace::features::is_fork_defaults_opt_out()
+        {
             profile.debuginfo = DebugInfo::Resolved(if is_member || pkg_id.is_none() {
                 TomlDebugInfo::LineTablesOnly
             } else {

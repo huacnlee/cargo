@@ -1,7 +1,7 @@
 //! Automatic garbage collection of the build-dir.
 //!
 //! Every distinct set of features, profile settings, `RUSTFLAGS` or compiler
-//! version produces new build units (see [`compute_metadata`]) instead of
+//! version produces new build units (see `compute_metadata`) instead of
 //! overwriting old ones, so without cleanup the build-dir only ever grows.
 //!
 //! After each successful build this module:
@@ -30,10 +30,8 @@
 //! Removing anything else is always safe: at worst it is rebuilt. Only the
 //! new build-dir layout is handled.
 //!
-//! [`compute_metadata`]: super::build_runner::compilation_files
 //! [`Workspace::shared_deps_dir`]: crate::workspace::Workspace::shared_deps_dir
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -43,8 +41,11 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
+use crate::util::data_structures::HashSet;
+use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
 use crate::util::{CargoResult, HumanBytes};
+use crate::workspace::features;
 use crate::workspace::gc::parse_human_size;
 
 /// Marker touched in every build unit used by a build.
@@ -150,7 +151,7 @@ pub fn run(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) {
 fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> CargoResult<()> {
     let gctx = build_runner.bcx.gctx;
     // The old layout mixes the files of all units in shared directories.
-    if !gctx.cli_unstable().build_dir_new_layout {
+    if !gctx.cli_unstable().build_dir_new_layout || features::is_fork_defaults_opt_out() {
         return Ok(());
     }
     let Some(settings) = GcSettings::from_config(build_runner)? else {
@@ -159,7 +160,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
 
     let now = FileTime::now();
     let files = build_runner.files();
-    let mut live = HashSet::new();
+    let mut live = HashSet::default();
     for unit in build_runner.bcx.unit_graph.keys() {
         let dir = files.build_unit_dir(unit);
         if live.insert(dir.clone()) && dir.is_dir() {
@@ -349,7 +350,7 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     // Held until the directory is gone.
     let _lock = match fs::File::open(path.join(".lock")) {
-        Ok(file) => match file.try_lock() {
+        Ok(file) => match flock::try_lock_exclusive(&file) {
             Ok(()) => Some(file),
             Err(fs::TryLockError::WouldBlock) => {
                 debug!("build.gc skipping {}: in use", path.display());

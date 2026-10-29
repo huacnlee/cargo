@@ -812,6 +812,10 @@ impl GlobalContext {
 
         let template_variables = replacements
             .iter()
+            .filter(|(key, _)| {
+                *key != "{workspace-name}"
+                    || !crate::workspace::features::is_fork_defaults_opt_out()
+            })
             .map(|(key, _)| key[1..key.len() - 1].to_string())
             .collect_vec();
 

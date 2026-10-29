@@ -509,6 +509,8 @@ impl<'gctx> Workspace<'gctx> {
             self.gctx()
                 .custom_build_dir(&default, self.root_manifest())
                 .expect("template is correct")
+        } else if crate::workspace::features::is_fork_defaults_opt_out() {
+            self.default_target_dir()
         } else {
             // Checkouts of the same project (e.g. many `git worktree`s) share
             // one build-dir so that dependencies are built once.
@@ -533,6 +535,7 @@ impl<'gctx> Workspace<'gctx> {
         if self.build_dir.is_some()
             || self.target_dir.is_some()
             || self.root_maybe().is_embedded()
+            || crate::workspace::features::is_fork_defaults_opt_out()
             || self.gctx.get_env_os("CARGO_SHARED_DEPS") == Some("0".as_ref())
         {
             return None;
@@ -556,6 +559,9 @@ impl<'gctx> Workspace<'gctx> {
     pub fn shared_build_dir_root(&self) -> Option<&Path> {
         self.shared_build_dir_root
             .get_or_init(|| {
+                if crate::workspace::features::is_fork_defaults_opt_out() {
+                    return None;
+                }
                 let root = std::fs::canonicalize(self.root()).ok()?;
                 let build_dir = self.build_dir().into_path_unlocked();
                 let build_dir = std::fs::canonicalize(&build_dir).unwrap_or(build_dir);

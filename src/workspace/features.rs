@@ -846,7 +846,8 @@ macro_rules! unstable_cli_options {
 
                 unstable.build_dir_new_layout = !is_new_build_dir_layout_opt_out();
                 // Lets builds of several checkouts sharing a build-dir run concurrently.
-                unstable.fine_grain_locking = !is_fine_grain_locking_opt_out();
+                unstable.fine_grain_locking =
+                    !is_fine_grain_locking_opt_out() && !is_fork_defaults_opt_out();
 
                 return unstable;
             }
@@ -1621,6 +1622,19 @@ pub fn is_nightly_toolchain(rustc_version: &semver::Version) -> bool {
 )]
 pub fn is_stop_rlib_uplift_opt_out() -> bool {
     env::var("__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT").as_deref() == Ok("1")
+}
+
+/// Restores upstream Cargo's defaults in place of this fork's: the build-dir
+/// in `target`, no shared dependencies, no build-dir GC, no fine-grained
+/// locking, upstream `dev` debuginfo, LLVM and a single-threaded front end.
+/// Cargo's own test suite sets it so its snapshots stay upstream's; explicit
+/// configuration still applies.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Not part of the public interface"
+)]
+pub fn is_fork_defaults_opt_out() -> bool {
+    env::var("__CARGO_FORK_DEFAULTS_OPT_OUT").as_deref() == Ok("1")
 }
 
 #[expect(

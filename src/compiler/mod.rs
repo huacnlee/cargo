@@ -372,6 +372,7 @@ fn rustc(
     // (`OSO lib.rlib(member.o)`) instead, so the loose ones only take space,
     // and stale ones from earlier codegen unit splits pile up.
     let loose_objects_prefix = (matches!(unit.mode, CompileMode::Build)
+        && !crate::workspace::features::is_fork_defaults_opt_out()
         && build_runner
             .bcx
             .target_data
@@ -1381,7 +1382,9 @@ fn add_error_format_and_color(build_runner: &BuildRunner<'_, '_>, cmd: &mut Proc
 /// Threads for rustc's parallel frontend, when the rustc in use supports it.
 /// `CARGO_RUSTC_THREADS` overrides the default; `1` disables it.
 fn frontend_threads(bcx: &BuildContext<'_, '_>) -> Option<usize> {
-    if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev") {
+    if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev")
+        || crate::workspace::features::is_fork_defaults_opt_out()
+    {
         return None;
     }
     #[expect(clippy::disallowed_methods, reason = "fork-only knob")]

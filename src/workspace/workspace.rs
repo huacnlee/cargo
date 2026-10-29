@@ -509,6 +509,8 @@ impl<'gctx> Workspace<'gctx> {
             self.gctx()
                 .custom_build_dir(&default, self.root_manifest())
                 .expect("template is correct")
+        } else if crate::workspace::features::is_fork_defaults_opt_out() {
+            self.default_target_dir()
         } else {
             // Checkouts of the same project (e.g. many `git worktree`s) share
             // one build-dir so that dependencies are built once.
@@ -523,6 +525,30 @@ impl<'gctx> Workspace<'gctx> {
         }
     }
 
+    /// Where build units of registry and git packages go when the default
+    /// build-dir is in use, so every project on the machine shares them.
+    /// Their metadata hash never depends on the workspace, so projects with
+    /// the same dependency, features and profile reuse one build.
+    ///
+    /// `CARGO_SHARED_DEPS=0` keeps them in the project's build-dir.
+    pub fn shared_deps_dir(&self) -> Option<PathBuf> {
+        if self.build_dir.is_some()
+            || self.target_dir.is_some()
+            || self.root_maybe().is_embedded()
+            || crate::workspace::features::is_fork_defaults_opt_out()
+            || self.gctx.get_env_os("CARGO_SHARED_DEPS") == Some("0".as_ref())
+        {
+            return None;
+        }
+        Some(
+            self.gctx
+                .home()
+                .as_path_unlocked()
+                .join("targets")
+                .join("shared-deps"),
+        )
+    }
+
     /// The canonical workspace root, if the build-dir lives outside of it and
     /// so may be shared with other workspaces.
     ///
@@ -533,6 +559,9 @@ impl<'gctx> Workspace<'gctx> {
     pub fn shared_build_dir_root(&self) -> Option<&Path> {
         self.shared_build_dir_root
             .get_or_init(|| {
+                if crate::workspace::features::is_fork_defaults_opt_out() {
+                    return None;
+                }
                 let root = std::fs::canonicalize(self.root()).ok()?;
                 let build_dir = self.build_dir().into_path_unlocked();
                 let build_dir = std::fs::canonicalize(&build_dir).unwrap_or(build_dir);

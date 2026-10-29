@@ -1,7 +1,7 @@
 //! Automatic garbage collection of the build-dir.
 //!
 //! Every distinct set of features, profile settings, `RUSTFLAGS` or compiler
-//! version produces new build units (see [`compute_metadata`]) instead of
+//! version produces new build units (see `compute_metadata`) instead of
 //! overwriting old ones, so without cleanup the build-dir only ever grows.
 //!
 //! After each successful build this module:
@@ -19,15 +19,19 @@
 //!    then keeps removing the least recently used ones while the build-dir is
 //!    larger than `build.gc.max-size`.
 //!
+//! The build-dir shared by all projects for registry and git dependencies
+//! (see [`Workspace::shared_deps_dir`]) is collected the same way, after the
+//! build-dir of the workspace, with its own size limit,
+//! `build.gc.shared-max-size` (50 GiB by default).
+//!
 //! Units of the current build are never removed, nor are units another Cargo
 //! holds a lock on (`-Zfine-grain-locking` keeps a shared lock on every unit
 //! a build uses), nor, when trimming to size, anything used in the last hour.
 //! Removing anything else is always safe: at worst it is rebuilt. Only the
 //! new build-dir layout is handled.
 //!
-//! [`compute_metadata`]: super::build_runner::compilation_files
+//! [`Workspace::shared_deps_dir`]: crate::workspace::Workspace::shared_deps_dir
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -37,8 +41,11 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
+use crate::util::data_structures::HashSet;
+use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
 use crate::util::{CargoResult, HumanBytes};
+use crate::workspace::features;
 use crate::workspace::gc::parse_human_size;
 
 /// Marker touched in every build unit used by a build.
@@ -48,12 +55,13 @@ const LAST_GC_FILE: &str = ".cargo-gc-last";
 
 const DEFAULT_MAX_UNUSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_SHARED_MAX_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 const DEFAULT_FREQUENCY: Duration = Duration::from_secs(60 * 60);
 /// Trimming to `max-size` never touches what was used this recently, so
 /// concurrent builds sharing the build-dir do not evict each other.
 const MIN_AGE_FOR_SIZE_LIMIT: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum MaxSize {
     None,
     Bytes(u64),
@@ -66,6 +74,8 @@ enum MaxSize {
 struct GcSettings {
     max_unused: Duration,
     max_size: MaxSize,
+    /// Limit for the shared build-dir; `Auto` is not used there.
+    shared_max_size: MaxSize,
     /// `None` means never collect.
     frequency: Option<Duration>,
 }
@@ -75,6 +85,7 @@ impl Default for GcSettings {
         GcSettings {
             max_unused: DEFAULT_MAX_UNUSED,
             max_size: MaxSize::Auto,
+            shared_max_size: MaxSize::Bytes(DEFAULT_SHARED_MAX_SIZE),
             frequency: Some(DEFAULT_FREQUENCY),
         }
     }
@@ -105,6 +116,11 @@ impl GcSettings {
             Some("none") => MaxSize::None,
             Some(s) => MaxSize::Bytes(parse_human_size(s)?),
         };
+        let shared_max_size = match cfg.shared_max_size.as_deref() {
+            None => MaxSize::Bytes(DEFAULT_SHARED_MAX_SIZE),
+            Some("none") => MaxSize::None,
+            Some(s) => MaxSize::Bytes(parse_human_size(s)?),
+        };
         let frequency = match cfg.frequency.as_deref() {
             None => Some(DEFAULT_FREQUENCY),
             Some("never") => None,
@@ -114,6 +130,7 @@ impl GcSettings {
         Ok(Some(GcSettings {
             max_unused,
             max_size,
+            shared_max_size,
             frequency,
         }))
     }
@@ -134,7 +151,7 @@ pub fn run(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) {
 fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> CargoResult<()> {
     let gctx = build_runner.bcx.gctx;
     // The old layout mixes the files of all units in shared directories.
-    if !gctx.cli_unstable().build_dir_new_layout {
+    if !gctx.cli_unstable().build_dir_new_layout || features::is_fork_defaults_opt_out() {
         return Ok(());
     }
     let Some(settings) = GcSettings::from_config(build_runner)? else {
@@ -143,7 +160,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
 
     let now = FileTime::now();
     let files = build_runner.files();
-    let mut live = HashSet::new();
+    let mut live = HashSet::default();
     for unit in build_runner.bcx.unit_graph.keys() {
         let dir = files.build_unit_dir(unit);
         if live.insert(dir.clone()) && dir.is_dir() {
@@ -154,21 +171,32 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
     let Some(frequency) = settings.frequency else {
         return Ok(());
     };
-    let root = build_runner.bcx.ws.build_dir().into_path_unlocked();
-    let marker = root.join(LAST_GC_FILE);
-    if age(mtime(&marker)) < frequency {
-        return Ok(());
+    let ws = build_runner.bcx.ws;
+    let mut roots = vec![(ws.build_dir().into_path_unlocked(), settings.max_size)];
+    if files.layouts().any(|l| l.shared_build_dir().is_some()) {
+        if let Some(shared) = ws.shared_deps_dir() {
+            roots.push((shared, settings.shared_max_size));
+        }
     }
 
     let mut removed = Removed::default();
-    collect(
-        &root,
-        &live,
-        FileTime::from_system_time(build_start),
-        &settings,
-        &mut removed,
-    )?;
-    touch(&marker, now)?;
+    for (root, max_size) in roots {
+        let marker = root.join(LAST_GC_FILE);
+        if age(mtime(&marker)) < frequency {
+            continue;
+        }
+        collect(
+            &root,
+            &live,
+            FileTime::from_system_time(build_start),
+            &GcSettings {
+                max_size,
+                ..settings
+            },
+            &mut removed,
+        )?;
+        touch(&marker, now)?;
+    }
 
     if removed.count > 0 {
         gctx.shell().status(
@@ -322,7 +350,7 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     // Held until the directory is gone.
     let _lock = match fs::File::open(path.join(".lock")) {
-        Ok(file) => match file.try_lock() {
+        Ok(file) => match flock::try_lock_exclusive(&file) {
             Ok(()) => Some(file),
             Err(fs::TryLockError::WouldBlock) => {
                 debug!("build.gc skipping {}: in use", path.display());

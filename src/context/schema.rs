@@ -455,6 +455,10 @@ pub struct BuildDirGcConfig {
     /// `"auto"` (the default) is 10 GiB or twice what the build uses. Counts
     /// the whole build-dir: every target and profile.
     pub max_size: Option<String>,
+    /// Size limit of the build-dir every project shares for registry and git
+    /// dependencies (`{cargo-cache-home}/targets/shared-deps`). Defaults to
+    /// 50 GiB; `"none"` disables it.
+    pub shared_max_size: Option<String>,
     /// How often to scan the build-dir: `"always"`, `"never"`, or a span.
     pub frequency: Option<String>,
 }

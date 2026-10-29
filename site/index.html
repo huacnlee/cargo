@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>huacnlee/cargo</title>
 <link rel="icon" href="favicon.ico" sizes="48x48 32x32">
-<meta name="description" content="A drop-in Cargo that shares build output across git worktrees, keeps each project's build directory under a size limit, and needs no configuration.">
+<meta name="description" content="A drop-in Cargo that shares build output across git worktrees and projects, keeps each project's build directory under a size limit, and needs no configuration.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -280,6 +280,12 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
     <div class="metrics" id="metrics"></div>
   </section>
 
+  <section id="projects">
+    <h2>Projects share dependencies too</h2>
+    <p class="section-desc" id="projects-setup"></p>
+    <div class="metrics" id="projects-metrics"></div>
+  </section>
+
   <section id="cleanup">
     <h2>What a cleanup looks like</h2>
     <p class="section-desc">After a build, at most once an hour, Cargo removes what no checkout has used for a week, then the least recently used units until the project fits. It prints one line when it frees something.</p>
@@ -293,8 +299,10 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
     <p class="section-desc">Your projects, <code>Cargo.toml</code> and <code>.cargo/config.toml</code> stay as they are.</p>
     <ul class="changes">
       <li><strong>One build directory per project.</strong> Intermediate files go to <code>~/.cargo/targets/&lt;name&gt;-&lt;hash&gt;/</code>, where the hash comes from the repository's <code>.git</code> directory. Every worktree lands there wherever it is created, reuses compiled dependencies, and only builds its own crates. Binaries still appear in <code>./target</code>.</li>
-      <li><strong>A size limit.</strong> The larger of 10 GiB and twice the last build. Units used in the last hour are never removed.</li>
-      <li><strong>Worktrees build at the same time.</strong> Fine-grained locking is on, so parallel agents do not queue on one lock.</li>
+      <li><strong>Dependencies shared by every project.</strong> Registry and git dependencies build once in <code>~/.cargo/targets/shared-deps/</code> and are reused by any project that needs the same version, features and profile, like Go's build cache.</li>
+      <li><strong>A size limit.</strong> Each project keeps to the larger of 10 GiB and twice the last build; shared dependencies keep to 50 GiB. Units used in the last hour are never removed, and the crates you are working on keep their incremental caches.</li>
+      <li><strong>No duplicate object files on macOS.</strong> Debuggers and backtraces read the objects inside each rlib, so the loose copies beside it are removed.</li>
+      <li><strong>Worktrees build at the same time.</strong> Fine-grained locking is on, so parallel agents do not queue on one lock. When two builds need the same dependency at once, one compiles it and the other reuses the result.</li>
       <li><strong>Less debug info in dev builds.</strong> Line tables for your crates, none for dependencies. Backtraces keep file and line. A <code>debug</code> setting in your profile still wins.</li>
       <li><strong>Cranelift on nightly.</strong> <code>cargo build</code> compiles your crates with Cranelift and runs the compiler front end on up to 8 threads. Tests and release builds keep LLVM. The installer adds the Cranelift component when you have a nightly toolchain.</li>
     </ul>
@@ -303,10 +311,11 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
 <pre class="term"><span class="prompt"># ~/.cargo/config.toml</span>
 <span class="cmdline">[build.gc]</span>
 max-size = "auto"      <span class="prompt"># or "15 GiB", "none"</span>
+shared-max-size = "50 GiB"
 max-unused = "7 days"
 frequency = "1 hour"   <span class="prompt"># or "always", "never"</span>
 enabled = true</pre>
-      <p>Set <code>CARGO_DEV_CRANELIFT=0</code> to keep LLVM on nightly, and <code>CARGO_RUSTC_THREADS=1</code> for a single-threaded front end.</p>
+      <p>Set <code>CARGO_SHARED_DEPS=0</code> to keep dependencies in the project's build directory, <code>CARGO_DEV_CRANELIFT=0</code> to keep LLVM on nightly, and <code>CARGO_RUSTC_THREADS=1</code> for a single-threaded front end.</p>
     </details>
   </section>
 </main>
@@ -328,6 +337,17 @@ const DATA = {
       rows: [["Cargo", "stock", 272.9], ["Fork", "fork", 233.9]] },
     { title: "Rebuild after editing a core crate", note: "Touch nsh-core, which most of the workspace depends on. The fork does not make this faster, on stable or with Cranelift on nightly.", unit: "s",
       rows: [["Cargo", "stock", 19.1], ["Fork", "fork", 19.9], ["Fork, nightly", "nightly", 21.4]] },
+  ],
+  projectsSetup: "Release builds of Cargo 1.99.0 and this fork, run one after another on the same machine: nsh, then mado (a 330-crate app in its own repository), then mado again from an empty build directory, as a new worktree or after cargo clean would start. One run each.",
+  projects: [
+    { title: "nsh, first build", note: "Empty build directories. The same speed; dependencies now land in the shared directory.", unit: "s",
+      rows: [["Cargo", "stock", 207.9], ["Fork", "fork", 206.7]] },
+    { title: "mado, first build after nsh", note: "mado builds its dependencies at opt-level 3 and nsh at 0, so the two share almost nothing (1 of 330 crates). The fork is faster because dependencies carry no debug info.", unit: "s",
+      rows: [["Cargo", "stock", 513.8], ["Fork", "fork", 379.2]] },
+    { title: "mado again, empty build directory", note: "Cargo compiles all 330 crates again, as in its first build. The fork finds the dependencies in the shared directory and compiles 2 crates.", unit: "s",
+      rows: [["Cargo", "stock", 513.8], ["Fork", "fork", 16.2]] },
+    { title: "Disk after nsh and mado", note: "Cargo: both target directories. Fork: both project directories (2.3 GB and 0.4 GB) and the shared dependencies (2.2 GB).", unit: " GB",
+      rows: [["Cargo", "stock", 10.3], ["Fork", "fork", 4.9]] },
   ],
 };
 
@@ -375,24 +395,29 @@ $("val-time").textContent = `${fmtMin(stockTime)} → ${fmtMin(forkTime)}`;
 growth($("grow-time"), $("axis-time"), total, fmtMin);
 
 $("setup").textContent = DATA.setup;
-const host = $("metrics");
-for (const m of DATA.metrics) {
-  const max = Math.max(...m.rows.map(r => r[2]));
-  const el = document.createElement("div");
-  el.className = "metric";
-  el.innerHTML = '<h3></h3><p class="note"></p>';
-  el.querySelector("h3").textContent = m.title;
-  el.querySelector(".note").textContent = m.note;
-  for (const [who, kind, v, label] of m.rows) {
-    const pct = (v / max) * 78;
-    const row = document.createElement("div");
-    row.className = "row";
-    row.innerHTML = `<span class="who"></span><div class="track"><div class="fill ${kind}" style="width:${pct}%"></div><span class="val" style="left:${pct}%"></span></div>`;
-    row.querySelector(".who").textContent = who;
-    row.querySelector(".val").textContent = label ?? `${v}${m.unit}`;
-    el.append(row);
+$("projects-setup").textContent = DATA.projectsSetup;
+renderMetrics($("metrics"), DATA.metrics);
+renderMetrics($("projects-metrics"), DATA.projects);
+
+function renderMetrics(host, metrics) {
+  for (const m of metrics) {
+    const max = Math.max(...m.rows.map(r => r[2]));
+    const el = document.createElement("div");
+    el.className = "metric";
+    el.innerHTML = '<h3></h3><p class="note"></p>';
+    el.querySelector("h3").textContent = m.title;
+    el.querySelector(".note").textContent = m.note;
+    for (const [who, kind, v, label] of m.rows) {
+      const pct = (v / max) * 78;
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `<span class="who"></span><div class="track"><div class="fill ${kind}" style="width:${pct}%"></div><span class="val" style="left:${pct}%"></span></div>`;
+      row.querySelector(".who").textContent = who;
+      row.querySelector(".val").textContent = label ?? `${v}${m.unit}`;
+      el.append(row);
+    }
+    host.append(el);
   }
-  host.append(el);
 }
 
 // Theme: swap without animating every color.

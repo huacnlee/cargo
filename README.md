@@ -58,18 +58,50 @@ the last build, whichever is larger.
 Rebuilding after an edit is not faster on this workspace, on stable or with
 Cranelift on nightly.
 
+### Across projects
+
+Release builds of Cargo 1.99.0 and this fork, run one after another on the
+same machine: nsh, then [mado](https://github.com/longbridge/mado) (a 330-crate
+app in its own repository), then mado again from an empty build directory, as
+a new worktree or `cargo clean` would start. One run each:
+
+| Build | Cargo | This fork |
+|---|---:|---:|
+| nsh, first build | 207.9 s | 206.7 s |
+| mado, first build after nsh | 513.8 s | 379.2 s |
+| mado again, empty build directory | 513.8 s ¹ | 16.2 s |
+| Disk after nsh and mado | 10.3 GB | 4.9 GB |
+
+¹ Cargo compiles all 330 crates again, as in its first build; the fork
+compiles 2 and takes the rest from `~/.cargo/targets/shared-deps/`.
+
+mado builds its dependencies at `opt-level = 3` and nsh at 0, so the two share
+almost nothing (1 of 330 crates); the fork is faster on mado's first build
+because dependencies carry no debug info. The fork's 4.9 GB is both project
+directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
+
 ## What changes
 
-- **One build directory per project.** Intermediate files go to
+- **One build directory per project.** Your crates build in
   `~/.cargo/targets/<name>-<hash>/`; the hash comes from the repository's main
   `.git` directory, so every worktree lands there wherever it is created.
-  Worktrees reuse registry and git dependencies and build only their own
-  crates. Binaries still appear in `./target`.
+  Binaries still appear in `./target`.
+- **Dependencies are shared by every project.** Registry and git dependencies
+  build once in `~/.cargo/targets/shared-deps/` and are reused by any project
+  that needs the same version, features and profile, the way Go's build cache
+  works.
 - **It cleans itself.** After a build, at most once an hour, units unused for
-  7 days, stale incremental caches and old-layout leftovers are removed, then
-  the least recently used units until the project fits the larger of 10 GiB
-  and twice the last build. Units used in the last hour are never removed.
-- **Worktrees build at the same time.** Fine-grained locking is on.
+  7 days are removed, then the least recently used units until each project
+  fits the larger of 10 GiB and twice the last build, and the shared
+  dependencies fit 50 GiB. Units used in the last hour are never removed.
+  Incremental caches live with their unit, so the crates you are working on
+  keep them.
+- **No duplicate object files on macOS.** Debuggers and backtraces read the
+  objects inside each rlib, so the loose copies rustc leaves beside it are
+  removed.
+- **Worktrees build at the same time.** Fine-grained locking is on. When two
+  builds need the same dependency at once, one compiles it and the other
+  reuses the result.
 - **Less debug info in dev builds.** Line tables for workspace members, none
   for dependencies. A `debug` setting in your profile still wins.
 - **Cranelift on nightly.** `cargo build` compiles local crates with Cranelift
@@ -82,11 +114,13 @@ All of these are defaults. To change one:
 # ~/.cargo/config.toml
 [build.gc]
 max-size = "auto"     # or "15 GiB", "none"
+shared-max-size = "50 GiB"  # shared dependencies; or "none"
 max-unused = "7 days"
 frequency = "1 hour"  # or "always", "never"
 enabled = true
 ```
 
+`CARGO_SHARED_DEPS=0` keeps dependencies in the project's build directory;
 `CARGO_DEV_CRANELIFT=0` keeps LLVM on nightly; `CARGO_RUSTC_THREADS=1` makes
 the front end single-threaded.
 

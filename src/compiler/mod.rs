@@ -241,14 +241,7 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
-            job.before(if job.freshness().is_dirty() {
-                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
-                    rustdoc(build_runner, unit)?
-                } else {
-                    rustc(build_runner, unit, exec)?
-                };
-                work.then(link_targets(build_runner, unit, false)?)
-            } else {
+            let fresh_work = |build_runner: &mut BuildRunner<'_, '_>| -> CargoResult<Work> {
                 let output_options = OutputOptions::for_fresh(build_runner, unit);
                 let manifest = ManifestErrorContext::new(build_runner, unit);
                 let work = replay_output_cache(
@@ -259,7 +252,34 @@ fn compile<'gctx>(
                     output_options,
                 );
                 // Need to link targets on both the dirty and fresh.
-                work.then(link_targets(build_runner, unit, true)?)
+                Ok(work.then(link_targets(build_runner, unit, true)?))
+            };
+            job.before(if job.freshness().is_dirty() {
+                let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                    rustdoc(build_runner, unit)?
+                } else {
+                    rustc(build_runner, unit, exec)?
+                };
+                let work = work.then(link_targets(build_runner, unit, false)?);
+                // Another Cargo may build a shared unit while this one waits
+                // for the exclusive lock below; reuse its output then.
+                match fingerprint::built_elsewhere(build_runner, unit) {
+                    Some(built_elsewhere)
+                        if lock.is_some() && build_runner.files().is_shared_unit(unit) =>
+                    {
+                        let fresh = fresh_work(build_runner)?;
+                        Work::new(move |state| {
+                            if built_elsewhere() {
+                                fresh.call(state)
+                            } else {
+                                work.call(state)
+                            }
+                        })
+                    }
+                    _ => work,
+                }
+            } else {
+                fresh_work(build_runner)?
             });
 
             // If -Zfine-grain-locking is enabled, we wrap the job with an upgrade to exclusive
@@ -347,6 +367,29 @@ fn rustc(
     let rustc_dep_info_loc = root.join(dep_info_name);
     let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
 
+    // On Apple targets rustc leaves each codegen unit's object file next to
+    // an rlib for debuggers. Binaries reference the copies inside the rlib
+    // (`OSO lib.rlib(member.o)`) instead, so the loose ones only take space,
+    // and stale ones from earlier codegen unit splits pile up.
+    let loose_objects_prefix = (matches!(unit.mode, CompileMode::Build)
+        && !crate::workspace::features::is_fork_defaults_opt_out()
+        && build_runner
+            .bcx
+            .target_data
+            .short_name(&unit.kind)
+            .contains("-apple-")
+        && unit
+            .target
+            .rustc_crate_types()
+            .iter()
+            .all(|ct| matches!(ct, CrateType::Lib | CrateType::Rlib)))
+    .then(
+        || match build_runner.files().metadata(unit).c_extra_filename() {
+            Some(extra) => format!("{}-{}.", unit.target.crate_name(), extra),
+            None => format!("{}.", unit.target.crate_name()),
+        },
+    );
+
     let mut output_options = OutputOptions::for_dirty(build_runner, unit);
     let package_id = unit.pkg.package_id();
     let target = Target::clone(&unit.target);
@@ -357,7 +400,7 @@ fn rustc(
     let exec = exec.clone();
 
     let root_output = build_runner.files().host_dest().map(|v| v.to_path_buf());
-    let build_dir = build_runner.bcx.ws.build_dir().into_path_unlocked();
+    let build_dir = build_runner.files().unit_build_root(unit);
     let pkg_root = unit.pkg.root().to_path_buf();
     let ws_root = build_runner.bcx.ws.root().to_path_buf();
     let cwd = rustc
@@ -564,6 +607,10 @@ fn rustc(
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
             paths::set_file_time_no_err(dep_info_loc, timestamp);
+        }
+
+        if let Some(prefix) = &loose_objects_prefix {
+            remove_loose_objects(&root, prefix);
         }
 
         // This mtime shift for .rmeta is a workaround as rustc incremental build
@@ -1085,7 +1132,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
 
     let rustdoc_dep_info_loc = rustdoc_dep_info_loc(build_runner, unit);
     let dep_info_loc = fingerprint::dep_info_loc(build_runner, unit);
-    let build_dir = build_runner.bcx.ws.build_dir().into_path_unlocked();
+    let build_dir = build_runner.files().unit_build_root(unit);
     let pkg_root = unit.pkg.root().to_path_buf();
     let ws_root = build_runner.bcx.ws.root().to_path_buf();
     let cwd = rustdoc
@@ -1335,7 +1382,9 @@ fn add_error_format_and_color(build_runner: &BuildRunner<'_, '_>, cmd: &mut Proc
 /// Threads for rustc's parallel frontend, when the rustc in use supports it.
 /// `CARGO_RUSTC_THREADS` overrides the default; `1` disables it.
 fn frontend_threads(bcx: &BuildContext<'_, '_>) -> Option<usize> {
-    if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev") {
+    if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev")
+        || crate::workspace::features::is_fork_defaults_opt_out()
+    {
         return None;
     }
     #[expect(clippy::disallowed_methods, reason = "fork-only knob")]
@@ -1792,6 +1841,20 @@ fn add_custom_flags(
     }
 
     Ok(())
+}
+
+/// Removes `<prefix>*.rcgu.o` from `dir`. See `loose_objects_prefix`.
+fn remove_loose_objects(dir: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(prefix) && name.ends_with(".rcgu.o") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Generate a list of `-L` arguments

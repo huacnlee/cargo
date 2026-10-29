@@ -232,8 +232,21 @@ impl<'gctx> Workspace<'gctx> {
             ws.root_manifest = ws.find_root(manifest_path)?;
         }
 
-        ws.target_dir = gctx.target_dir()?;
-        ws.build_dir = gctx.build_dir(ws.root_manifest())?;
+        // Convention over configuration: `./target` and the shared build-dir
+        // are fixed, so flags or env vars (often passed by tools and agents)
+        // cannot scatter build output across the disk.
+        if gctx.target_dir()?.is_some() {
+            gctx.shell().warn(
+                "ignoring the configured target directory (--target-dir, CARGO_TARGET_DIR, \
+                 build.target-dir); this cargo always uses `./target`",
+            )?;
+        }
+        if gctx.build_dir(ws.root_manifest())?.is_some() {
+            gctx.shell().warn(
+                "ignoring the configured build directory (build.build-dir); \
+                 this cargo always uses `~/.cargo/targets`",
+            )?;
+        }
 
         ws.custom_metadata = ws
             .load_workspace_config()?
@@ -296,11 +309,8 @@ impl<'gctx> Workspace<'gctx> {
         ws.packages
             .packages
             .insert(ws.current_manifest.clone(), package);
-        ws.target_dir = if let Some(dir) = target_dir {
-            Some(dir)
-        } else {
-            ws.gctx.target_dir()?
-        };
+        // Only cargo itself picks a target directory here, never the user.
+        ws.target_dir = target_dir;
         ws.build_dir = ws.target_dir.clone();
         ws.members.insert(ws.current_manifest.clone());
         ws.member_ids.insert(id);
@@ -487,7 +497,8 @@ impl<'gctx> Workspace<'gctx> {
     pub fn build_dir(&self) -> Filesystem {
         self.build_dir
             .clone()
-            .or_else(|| self.target_dir.clone())
+            // Unlike upstream, an explicit target-dir does not move the
+            // build-dir: intermediate files stay in the shared, bounded one.
             .unwrap_or_else(|| self.default_build_dir())
     }
 

@@ -12,7 +12,9 @@
 //!    the workspace (every `[<target>]/<profile>/` in it) as one pool. Oldest
 //!    first, it removes
 //!    * build units (`build/<pkg>/<hash>/`) not used for `build.gc.max-unused`,
-//!    * incremental session dirs (`incremental/<crate>-<id>/`) likewise,
+//!    * incremental session dirs (`incremental/<crate>-<id>/`) likewise, and
+//!      all but the [`KEEP_INCREMENTAL`] most recent of each crate (every
+//!      checkout, feature set and profile gets its own),
 //!    * leftovers from the old layout (`deps/`, `.fingerprint/`,
 //!      `build/<pkg>-<hash>/`),
 //!
@@ -26,7 +28,7 @@
 //!
 //! Units of the current build are never removed, nor are units another Cargo
 //! holds a lock on (`-Zfine-grain-locking` keeps a shared lock on every unit
-//! a build uses), nor, when trimming to size, anything used in the last hour.
+//! a build uses), nor incremental dirs a running rustc has locked.
 //! Removing anything else is always safe: at worst it is rebuilt. Only the
 //! new build-dir layout is handled.
 //!
@@ -52,21 +54,22 @@ use crate::workspace::gc::parse_human_size;
 const LAST_USE_FILE: &str = ".cargo-last-use";
 /// Marker recording when a build-dir was last collected.
 const LAST_GC_FILE: &str = ".cargo-gc-last";
+/// `<unix seconds> <bytes>` lines: what each recent build used.
+const BUILD_SIZES_FILE: &str = ".cargo-gc-sizes";
 
-const DEFAULT_MAX_UNUSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const DEFAULT_MAX_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_UNUSED: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_SHARED_MAX_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 const DEFAULT_FREQUENCY: Duration = Duration::from_secs(60 * 60);
-/// Trimming to `max-size` never touches what was used this recently, so
-/// concurrent builds sharing the build-dir do not evict each other.
-const MIN_AGE_FOR_SIZE_LIMIT: Duration = Duration::from_secs(60 * 60);
+/// Incremental dirs kept per crate name, the most recently used first.
+const KEEP_INCREMENTAL: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MaxSize {
     None,
     Bytes(u64),
-    /// [`DEFAULT_MAX_SIZE`], raised to twice what the current build uses so
-    /// huge projects keep room for one more configuration (e.g. `test`).
+    /// Twice the largest build within `max-unused`: bounded by the project's
+    /// own size, with room for one more configuration (e.g. `test` or another
+    /// worktree), and not shrunk by a small build such as a one-crate check.
     Auto,
 }
 
@@ -168,6 +171,14 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
         }
     }
 
+    let root = build_runner.bcx.ws.build_dir().into_path_unlocked();
+    let live_bytes = live
+        .iter()
+        .filter(|d| d.starts_with(&root))
+        .map(|d| cargo_util::du(d, &[]).unwrap_or(0))
+        .sum();
+    let largest_build = record_build_size(&root, live_bytes, settings.max_unused)?;
+
     let Some(frequency) = settings.frequency else {
         return Ok(());
     };
@@ -188,6 +199,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
         collect(
             &root,
             &live,
+            largest_build,
             FileTime::from_system_time(build_start),
             &GcSettings {
                 max_size,
@@ -234,6 +246,7 @@ impl Candidate {
 fn collect(
     root: &Path,
     live: &HashSet<PathBuf>,
+    largest_build: u64,
     build_start: FileTime,
     settings: &GcSettings,
     removed: &mut Removed,
@@ -258,10 +271,25 @@ fn collect(
         // rustc names these after the crate's `StableCrateId`, which Cargo does
         // not know, so they are aged by when rustc last wrote a session into
         // them. Anything written during this build belongs to it.
-        for dir in read_dirs(&profile.join("incremental"))? {
-            let last_use = newest_child_mtime(&dir);
-            if last_use < build_start {
-                candidates.push(Candidate::new(dir, last_use));
+        let mut incremental = read_dirs(&profile.join("incremental"))?
+            .into_iter()
+            .map(|dir| {
+                let last_use = newest_child_mtime(&dir);
+                (dir, last_use)
+            })
+            .collect::<Vec<_>>();
+        incremental.sort_by(|(a, a_use), (b, b_use)| {
+            crate_name(a).cmp(crate_name(b)).then(b_use.cmp(a_use))
+        });
+        for (i, (dir, last_use)) in incremental.iter().enumerate() {
+            let rank = incremental[..i]
+                .iter()
+                .filter(|(d, _)| crate_name(d) == crate_name(dir))
+                .count();
+            if rank >= KEEP_INCREMENTAL {
+                remove(dir, removed)?;
+            } else if *last_use < build_start {
+                candidates.push(Candidate::new(dir.clone(), *last_use));
             }
         }
         for name in ["deps", ".fingerprint"] {
@@ -285,14 +313,7 @@ fn collect(
     let max_size = match settings.max_size {
         MaxSize::None => None,
         MaxSize::Bytes(n) => Some(n),
-        MaxSize::Auto => {
-            let live_bytes: u64 = live
-                .iter()
-                .filter(|d| d.starts_with(root))
-                .map(|d| cargo_util::du(d, &[]).unwrap_or(0))
-                .sum();
-            Some(DEFAULT_MAX_SIZE.max(live_bytes * 2))
-        }
+        MaxSize::Auto => Some(largest_build * 2),
     };
     if let Some(max_size) = max_size {
         let mut total = 0;
@@ -309,7 +330,7 @@ fn collect(
             root.display()
         );
         for c in kept {
-            if total <= max_size || age(c.last_use) < MIN_AGE_FOR_SIZE_LIMIT {
+            if total <= max_size {
                 break;
             }
             total = total.saturating_sub(remove(&c.path, removed)?);
@@ -325,6 +346,32 @@ fn collect(
         }
     }
     Ok(())
+}
+
+/// Records what this build used and returns the largest build recorded
+/// within `window`, this one included.
+fn record_build_size(root: &Path, bytes: u64, window: Duration) -> CargoResult<u64> {
+    let path = root.join(BUILD_SIZES_FILE);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    let mut sizes = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (time, bytes) = line.split_once(' ')?;
+            Some((time.parse::<u64>().ok()?, bytes.parse::<u64>().ok()?))
+        })
+        .filter(|(time, _)| now.saturating_sub(*time) <= window.as_secs())
+        .collect::<Vec<_>>();
+    sizes.push((now, bytes));
+    let contents = sizes
+        .iter()
+        .map(|(time, bytes)| format!("{time} {bytes}\n"))
+        .collect::<String>();
+    paths::write(&path, contents)?;
+    Ok(sizes.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0))
 }
 
 /// The `[<target>]/<profile>/` directories of a build-dir.
@@ -346,26 +393,45 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 }
 
 /// Removes a directory, returning the bytes freed. Skips build units another
-/// Cargo holds the lock of.
+/// Cargo holds the lock of, and incremental dirs whose session a running
+/// rustc has locked (`s-*.lock`).
 fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
+    let mut lock_files = vec![path.join(".lock")];
+    if let Ok(entries) = fs::read_dir(path) {
+        lock_files.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "lock")),
+        );
+    }
     // Held until the directory is gone.
-    let _lock = match fs::File::open(path.join(".lock")) {
-        Ok(file) => match flock::try_lock_exclusive(&file) {
-            Ok(()) => Some(file),
+    let mut _locks = Vec::new();
+    for lock_file in lock_files {
+        let Ok(file) = fs::File::open(&lock_file) else {
+            continue;
+        };
+        match flock::try_lock_exclusive(&file) {
+            Ok(()) => _locks.push(file),
             Err(fs::TryLockError::WouldBlock) => {
                 debug!("build.gc skipping {}: in use", path.display());
                 return Ok(0);
             }
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
-        },
-        Err(_) => None,
-    };
+        }
+    }
     let size = cargo_util::du(path, &[]).unwrap_or(0);
     debug!("build.gc removing {}", path.display());
     paths::remove_dir_all(path)?;
     removed.count += 1;
     removed.bytes += size;
     Ok(size)
+}
+
+/// The crate name of an `incremental/<crate>-<id>` directory.
+fn crate_name(dir: &Path) -> &str {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    name.rsplit_once('-').map_or(name, |(krate, _)| krate)
 }
 
 /// Whether `dir` is an old-layout `build/<pkg>-<16 hex digits>` directory.
@@ -470,5 +536,20 @@ mod tests {
                 Path::new("release")
             ]
         );
+    }
+
+    #[test]
+    fn largest_recent_build() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-sizes-{}", std::process::id()));
+        fs::create_dir_all(&tmp).unwrap();
+        let day = Duration::from_secs(24 * 60 * 60);
+        // An entry older than the window no longer counts.
+        fs::write(tmp.join(BUILD_SIZES_FILE), "1 999999\n").unwrap();
+        assert_eq!(record_build_size(&tmp, 800, day).unwrap(), 800);
+        assert_eq!(record_build_size(&tmp, 100, day).unwrap(), 800);
+        assert_eq!(record_build_size(&tmp, 900, day).unwrap(), 900);
+        let lines = fs::read_to_string(tmp.join(BUILD_SIZES_FILE)).unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(lines.lines().count(), 3);
     }
 }

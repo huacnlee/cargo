@@ -1628,13 +1628,14 @@ pub fn is_stop_rlib_uplift_opt_out() -> bool {
 /// in `target`, no shared dependencies, no build-dir GC, no fine-grained
 /// locking, upstream `dev` debuginfo, LLVM and a single-threaded front end.
 /// Cargo's own test suite sets it so its snapshots stay upstream's; explicit
-/// configuration still applies.
+/// configuration still applies. Debug builds only: a released binary cannot
+/// be switched back by an env var.
 #[expect(
     clippy::disallowed_methods,
     reason = "Not part of the public interface"
 )]
 pub fn is_fork_defaults_opt_out() -> bool {
-    env::var("__CARGO_FORK_DEFAULTS_OPT_OUT").as_deref() == Ok("1")
+    cfg!(debug_assertions) && env::var("__CARGO_FORK_DEFAULTS_OPT_OUT").as_deref() == Ok("1")
 }
 
 #[expect(

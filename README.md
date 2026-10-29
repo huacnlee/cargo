@@ -47,8 +47,8 @@ after another. One run each with no compiler cache, so expect some noise:
 
 Cargo compiles every dependency again in each worktree. The fork compiles them
 once; each later worktree only builds its own workspace crates, about 90 s and
-2.6 GB. The shared build directory stays under its size limit, 10 GiB or twice
-the last build, whichever is larger.
+2.6 GB. The shared build directory stays under its size limit, twice the
+largest build of the last day.
 
 | Rebuild after editing a core crate | Cargo | This fork |
 |---|---:|---:|
@@ -86,16 +86,19 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   `~/.cargo/targets/<name>-<hash>/`; the hash comes from the repository's main
   `.git` directory, so every worktree lands there wherever it is created.
   Binaries still appear in `./target`.
+- **Fixed directories.** `./target` and `~/.cargo/targets` cannot be moved:
+  `--target-dir`, `CARGO_TARGET_DIR`, `build.target-dir` and `build.build-dir`
+  are ignored with a warning, so no flag, env var or tool can scatter build
+  output elsewhere.
 - **Dependencies are shared by every project.** Registry and git dependencies
   build once in `~/.cargo/targets/shared-deps/` and are reused by any project
   that needs the same version, features and profile, the way Go's build cache
   works.
 - **It cleans itself.** After a build, at most once an hour, units unused for
-  7 days are removed, then the least recently used units until each project
-  fits the larger of 10 GiB and twice the last build, and the shared
-  dependencies fit 50 GiB. Units used in the last hour are never removed.
-  Incremental caches live with their unit, so the crates you are working on
-  keep them.
+  a day are removed, then the least recently used units until each project
+  fits twice its largest build of the last day, and the shared dependencies
+  fit 50 GiB. Incremental caches live with their unit, so the crates you are
+  working on keep them. Nothing a running build has locked is removed.
 - **No duplicate object files on macOS.** Debuggers and backtraces read the
   objects inside each rlib, so the loose copies rustc leaves beside it are
   removed.
@@ -115,7 +118,7 @@ All of these are defaults. To change one:
 [build.gc]
 max-size = "auto"     # or "15 GiB", "none"
 shared-max-size = "50 GiB"  # shared dependencies; or "none"
-max-unused = "7 days"
+max-unused = "1 day"
 frequency = "1 hour"  # or "always", "never"
 enabled = true
 ```

@@ -440,8 +440,8 @@ pub struct CargoBuildConfig {
 /// ```toml
 /// [build.gc]
 /// enabled = true
-/// max-unused = "7 days"
-/// max-size = "auto" # 10 GiB, or twice what the build uses
+/// max-unused = "1 day"
+/// max-size = "auto" # twice the largest build of the last max-unused
 /// frequency = "1 hour"
 /// ```
 #[derive(Debug, Deserialize, Default)]
@@ -452,8 +452,8 @@ pub struct BuildDirGcConfig {
     pub max_unused: Option<String>,
     /// When the build-dir grows past this size, least recently used build
     /// units are removed until it fits. `"none"` disables the size limit;
-    /// `"auto"` (the default) is 10 GiB or twice what the build uses. Counts
-    /// the whole build-dir: every target and profile.
+    /// `"auto"` (the default) is twice the largest build within `max-unused`.
+    /// Counts the whole build-dir: every target and profile.
     pub max_size: Option<String>,
     /// Size limit of the build-dir every project shares for registry and git
     /// dependencies (`{cargo-cache-home}/targets/shared-deps`). Defaults to

@@ -375,7 +375,13 @@ impl<'gctx> InstallablePackage<'gctx> {
         let mut td_opt = None;
         let mut needs_cleanup = false;
         if !self.source_id.is_path() {
-            let target_dir = if let Some(dir) = self.gctx.target_dir()? {
+            // The configured target directory is ignored, see `Workspace::new`.
+            let configured = if crate::workspace::features::is_fork_defaults_opt_out() {
+                self.gctx.target_dir()?
+            } else {
+                None
+            };
+            let target_dir = if let Some(dir) = configured {
                 dir
             } else if let Ok(td) = TempFileBuilder::new().prefix("cargo-install").tempdir() {
                 let p = td.path().to_owned();

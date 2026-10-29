@@ -523,6 +523,29 @@ impl<'gctx> Workspace<'gctx> {
         }
     }
 
+    /// Where build units of registry and git packages go when the default
+    /// build-dir is in use, so every project on the machine shares them.
+    /// Their metadata hash never depends on the workspace, so projects with
+    /// the same dependency, features and profile reuse one build.
+    ///
+    /// `CARGO_SHARED_DEPS=0` keeps them in the project's build-dir.
+    pub fn shared_deps_dir(&self) -> Option<PathBuf> {
+        if self.build_dir.is_some()
+            || self.target_dir.is_some()
+            || self.root_maybe().is_embedded()
+            || self.gctx.get_env_os("CARGO_SHARED_DEPS") == Some("0".as_ref())
+        {
+            return None;
+        }
+        Some(
+            self.gctx
+                .home()
+                .as_path_unlocked()
+                .join("targets")
+                .join("shared-deps"),
+        )
+    }
+
     /// The canonical workspace root, if the build-dir lives outside of it and
     /// so may be shared with other workspaces.
     ///

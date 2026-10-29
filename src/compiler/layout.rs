@@ -209,7 +209,7 @@
 
 use crate::compiler::CompileTarget;
 use crate::util::flock::is_on_nfs_mount;
-use crate::util::{CargoResult, FileLock};
+use crate::util::{CargoResult, FileLock, Filesystem};
 use crate::workspace::Workspace;
 use cargo_util::paths;
 use std::path::{Path, PathBuf};
@@ -220,6 +220,9 @@ use std::path::{Path, PathBuf};
 pub struct Layout {
     artifact_dir: Option<ArtifactDirLayout>,
     build_dir: BuildDirLayout,
+    /// Build units of registry and git packages, shared by every workspace
+    /// using the default build-dir. See [`Workspace::shared_deps_dir`].
+    shared_build_dir: Option<BuildDirLayout>,
     _lock: Option<FileLock>,
 }
 
@@ -244,6 +247,7 @@ impl Layout {
             root.push(target.short_name());
             build_root.push(target.short_name());
         }
+        let profile = dest;
         let build_dest = build_root.join(dest);
         let dest = root.join(dest);
         // If the root directory doesn't already exist go ahead and create it
@@ -319,8 +323,39 @@ impl Layout {
         } else {
             None
         };
+        let shared_build_dir = match ws.shared_deps_dir() {
+            Some(mut shared_root)
+                if is_new_layout
+                    && ws.gctx().cli_unstable().fine_grain_locking
+                    && !must_take_build_dir_lock_exclusively =>
+            {
+                if let Some(target) = target {
+                    shared_root.push(target.short_name());
+                }
+                let shared_dest = Filesystem::new(shared_root.join(profile));
+                paths::create_dir_all_excluded_from_backups_atomic(&shared_root)?;
+                paths::create_dir_all(shared_dest.as_path_unlocked())?;
+                let lock = if is_on_nfs_mount(&shared_root) {
+                    None
+                } else {
+                    Some(shared_dest.open_ro_shared_create(
+                        ".cargo-build-lock",
+                        ws.gctx(),
+                        "shared build directory",
+                    )?)
+                };
+                Some(BuildDirLayout::new(
+                    shared_root,
+                    shared_dest.as_path_unlocked(),
+                    lock,
+                    is_new_layout,
+                ))
+            }
+            _ => None,
+        };
         Ok(Layout {
             artifact_dir,
+            shared_build_dir,
             build_dir: BuildDirLayout {
                 root: build_root.clone(),
                 deps,
@@ -343,6 +378,9 @@ impl Layout {
             artifact_dir.prepare()?;
         }
         self.build_dir.prepare()?;
+        if let Some(ref mut shared) = self.shared_build_dir {
+            shared.prepare()?;
+        }
 
         Ok(())
     }
@@ -353,6 +391,11 @@ impl Layout {
 
     pub fn build_dir(&self) -> &BuildDirLayout {
         &self.build_dir
+    }
+
+    /// The build-dir shared between workspaces, if any.
+    pub fn shared_build_dir(&self) -> Option<&BuildDirLayout> {
+        self.shared_build_dir.as_ref()
     }
 }
 
@@ -428,6 +471,27 @@ pub struct BuildDirLayout {
 }
 
 impl BuildDirLayout {
+    fn new(
+        root: PathBuf,
+        dest: &Path,
+        lock: Option<FileLock>,
+        is_new_layout: bool,
+    ) -> BuildDirLayout {
+        let deps = dest.join("deps");
+        BuildDirLayout {
+            artifact: deps.join("artifact"),
+            deps,
+            build: dest.join("build"),
+            incremental: dest.join("incremental"),
+            fingerprint: dest.join(".fingerprint"),
+            examples: dest.join("examples"),
+            tmp: root.join("tmp"),
+            root,
+            _lock: lock,
+            is_new_layout,
+        }
+    }
+
     /// Makes sure all directories stored in the Layout exist on the filesystem.
     pub fn prepare(&mut self) -> CargoResult<()> {
         if !self.is_new_layout {

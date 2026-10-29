@@ -108,7 +108,7 @@ pub(crate) fn trim_paths_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) 
             .into_iter()
             .map(join_remap),
     );
-    remaps.push(join_remap(build_dir_remap(build_runner)));
+    remaps.push(join_remap(build_dir_remap(build_runner, unit)));
     remaps.push(join_remap(sysroot_remap(build_runner, unit)));
     remaps
 }
@@ -257,8 +257,8 @@ fn git_checkout<'a>(
 ///   [`file!`] macro in-place via the `OUT_DIR` environment.
 /// * On Linux, `DW_AT_GNU_dwo_name` that contains paths to split debuginfo
 ///   files (dwp and dwo).
-fn build_dir_remap(build_runner: &BuildRunner<'_, '_>) -> RemapPair {
-    let from = build_runner.bcx.ws.build_dir().into_path_unlocked();
+fn build_dir_remap(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> RemapPair {
+    let from = build_runner.files().unit_build_root(unit);
     let to = "/cargo/build-dir".to_owned();
     (from, to)
 }
@@ -318,7 +318,7 @@ pub(crate) fn write_unremap_file(
     };
 
     insert(sysroot_remap(build_runner, unit));
-    insert(build_dir_remap(build_runner));
+    insert(build_dir_remap(build_runner, unit));
 
     let mut seen = HashSet::default();
     let mut stack = vec![unit.clone()];

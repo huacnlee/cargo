@@ -11,6 +11,7 @@ use cargo_util_schemas::manifest::TomlTrimPaths;
 use tracing::debug;
 
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
+use crate::compiler::layout::BuildDirLayout;
 use crate::compiler::trim_paths;
 use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
@@ -200,6 +201,34 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         }
     }
 
+    /// The build-dir holding the files of `unit` built for `kind`: the shared
+    /// one for registry and git packages, when there is one.
+    fn unit_build_dir(&self, kind: CompileKind, unit: &Unit) -> &BuildDirLayout {
+        let layout = self.layout(kind);
+        match layout.shared_build_dir() {
+            Some(shared) if !unit.pkg.package_id().source_id().is_path() => shared,
+            _ => layout.build_dir(),
+        }
+    }
+
+    /// Whether `unit` lives in the build-dir shared between workspaces, where
+    /// other Cargos may build it too.
+    pub fn is_shared_unit(&self, unit: &Unit) -> bool {
+        self.layout(unit.kind).shared_build_dir().is_some()
+            && !unit.pkg.package_id().source_id().is_path()
+    }
+
+    /// The build-dir root that the paths Cargo records for `unit` (dep-info,
+    /// fingerprints, remaps) are relative to.
+    pub fn unit_build_root(&self, unit: &Unit) -> PathBuf {
+        if self.is_shared_unit(unit) {
+            if let Some(root) = self.ws.shared_deps_dir() {
+                return root;
+            }
+        }
+        self.ws.build_dir().into_path_unlocked()
+    }
+
     /// Gets the metadata for the given unit.
     ///
     /// See [`Metadata`] and [`fingerprint`] module for more.
@@ -286,14 +315,14 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// Returns the host `deps` directory path for a given build unit.
     pub fn host_deps(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.host.build_dir().deps(&dir)
+        self.unit_build_dir(CompileKind::Host, unit).deps(&dir)
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
     /// specified unit.
     pub fn deps_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().deps(&dir)
+        self.unit_build_dir(unit.kind, unit).deps(&dir)
     }
 
     /// Returns the directories where Rust crate dependencies are found for the
@@ -302,22 +331,21 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     /// New features should consider using this so we can avoid their migrations.
     pub fn out_dir_new_layout(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind)
-            .build_dir()
+        self.unit_build_dir(unit.kind, unit)
             .out_force_new_layout(&dir)
     }
 
     /// Directory where the fingerprint for the given unit should go.
     pub fn fingerprint_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().fingerprint(&dir)
+        self.unit_build_dir(unit.kind, unit).fingerprint(&dir)
     }
 
     /// The lock location for a given build unit.
     /// The directory holding every file of a build unit (new layout).
     pub fn build_unit_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind).build_dir().build_unit(&dir)
+        self.unit_build_dir(unit.kind, unit).build_unit(&dir)
     }
 
     /// All layouts in use: the host one and one per cross-compile target.
@@ -327,15 +355,24 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
 
     pub fn build_unit_lock(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind)
-            .build_dir()
+        self.unit_build_dir(unit.kind, unit)
             .build_unit(&dir)
             .join(".lock")
     }
 
     /// Directory where incremental output for the given unit should go.
-    pub fn incremental_dir(&self, unit: &Unit) -> &Path {
-        self.layout(unit.kind).build_dir().incremental()
+    ///
+    /// With the new layout it lives in the unit's own directory, so it is
+    /// collected together with the unit and kept as long as the unit is.
+    pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
+        if self.ws.gctx().cli_unstable().build_dir_new_layout {
+            self.build_unit_dir(unit).join("incremental")
+        } else {
+            self.layout(unit.kind)
+                .build_dir()
+                .incremental()
+                .to_path_buf()
+        }
     }
 
     /// Directory where timing output should go.
@@ -375,8 +412,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         assert!(!unit.mode.is_run_custom_build());
         assert!(self.metas.contains_key(unit));
         let dir = self.pkg_dir(unit);
-        self.layout(CompileKind::Host)
-            .build_dir()
+        self.unit_build_dir(CompileKind::Host, unit)
             .build_script(&dir)
     }
 
@@ -401,7 +437,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
                 invalid
             ),
         };
-        self.layout(unit.kind).build_dir().artifact(&dir, kind)
+        self.unit_build_dir(unit.kind, unit).artifact(&dir, kind)
     }
 
     /// Returns the directory where information about running a build script
@@ -411,8 +447,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         assert!(unit.target.is_custom_build());
         assert!(unit.mode.is_run_custom_build());
         let dir = self.pkg_dir(unit);
-        self.layout(unit.kind)
-            .build_dir()
+        self.unit_build_dir(unit.kind, unit)
             .build_script_execution(&dir)
     }
 

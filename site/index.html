@@ -301,7 +301,7 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
       <li><strong>One build directory per project.</strong> Intermediate files go to <code>~/.cargo/targets/&lt;name&gt;-&lt;hash&gt;/</code>, where the hash comes from the repository's <code>.git</code> directory. Every worktree lands there wherever it is created, reuses compiled dependencies, and only builds its own crates. Binaries still appear in <code>./target</code>.</li>
       <li><strong>Fixed directories.</strong> <code>./target</code> and <code>~/.cargo/targets</code> cannot be moved: <code>--target-dir</code>, <code>CARGO_TARGET_DIR</code>, <code>build.target-dir</code> and <code>build.build-dir</code> are ignored with a warning, so no flag, env var or tool can scatter build output elsewhere.</li>
       <li><strong>Dependencies shared by every project.</strong> Registry and git dependencies build once in <code>~/.cargo/targets/shared-deps/</code> and are reused by any project that needs the same version, features and profile, like Go's build cache. <code>cargo check</code>, clippy, rust-analyzer and <code>cargo doc</code> use the same builds, so a check after a build only looks at your own crates.</li>
-      <li><strong>Your own crates shared by worktrees too.</strong> A workspace crate is keyed by the content of its files instead of the checkout it is in, so a new worktree of the same commit reuses every crate another worktree built, and switching back to a branch reuses what it built before. Editing a test or a binary rebuilds only that target. Crates with a build script, and crates that read their own path (<code>env!("CARGO_MANIFEST_DIR")</code>), still build per worktree. On nightly, worktrees also share rustc's incremental caches (<code>-Zremap-cwd-prefix=.</code>), so the first edit in a new worktree is incremental too; debug info then records <code>.</code> as the compile directory, so start a debugger from the workspace root. On stable each worktree keeps its own.</li>
+      <li><strong>Your own crates shared by worktrees too.</strong> A workspace crate is keyed by the content of its files instead of the checkout it is in, so a new worktree of the same commit reuses every crate another worktree built, and switching back to a branch reuses what it built before. Editing a test or a binary rebuilds only that target. Crates with a build script, and crates that read their own path (<code>env!("CARGO_MANIFEST_DIR")</code>), still build per worktree. Worktrees also share rustc's incremental caches, so the first edit in a new worktree is incremental too. For this rustc records <code>.</code> as the compile directory (<code>-Zremap-cwd-prefix=.</code>; on stable through <code>RUSTC_BOOTSTRAP=1</code> with no <code>#![feature]</code> allowed), so start a debugger from the workspace root.</li>
       <li><strong>A size limit.</strong> Each project keeps to twice its largest build of the last day, and its units unused for a day are removed. Shared dependencies are kept for 7 days and keep to 50 GiB; a project no build has used for 7 days is removed whole. The units an edit replaces are removed right away, unless another worktree uses them. Nothing a running build has locked is removed.</li>
       <li><strong>No duplicate object files on macOS.</strong> Debuggers and backtraces read the objects inside each rlib, so the loose copies beside it are removed.</li>
       <li><strong>Worktrees build at the same time.</strong> Fine-grained locking is on, so parallel agents do not queue on one lock. When two builds need the same dependency at once, one compiles it and the other reuses the result.</li>
@@ -330,17 +330,19 @@ enabled = true</pre>
 
 <script>
 const DATA = {
-  setup: "nsh, a 525-crate workspace, dev build of one binary per worktree on an 8-core Apple Silicon Mac. One run each, compiler caches such as sccache off.",
+  setup: "nsh, a 525-crate workspace, dev build of one binary per worktree on an 8-core Apple Silicon Mac, Rust 1.99 stable. Five worktrees of the same commit in one run; edits are the median of three runs. Compiler caches such as sccache off.",
   // Per worktree, in build order: [build seconds, total GB on disk afterwards].
   worktrees: {
-    stock: [[272.9, 6.6], [287.4, 13.2], [285.6, 19.8], [277.2, 26.4], [277.4, 33.0]],
-    fork: [[233.9, 3.9], [88.9, 6.5], [91.4, 9.1], [87.5, 11.7], [88.7, 14.3]],
+    stock: [[111.4, 6.7], [106.4, 13.4], [108.6, 20.1], [93.8, 26.9], [87.6, 33.6]],
+    fork: [[77.2, 3.7], [5.1, 4.0], [4.8, 4.4], [4.8, 4.8], [4.8, 5.1]],
   },
   metrics: [
     { title: "One worktree, first build", note: "Empty build directory. Most of the difference is debug info that dependencies no longer carry.", unit: "s",
-      rows: [["Cargo", "stock", 272.9], ["Fork", "fork", 233.9]] },
-    { title: "Rebuild after editing a core crate", note: "Touch nsh-core, which most of the workspace depends on. The fork does not make this faster, on stable or with Cranelift on nightly.", unit: "s",
-      rows: [["Cargo", "stock", 19.1], ["Fork", "fork", 19.9], ["Fork, nightly", "nightly", 21.4]] },
+      rows: [["Cargo", "stock", 111.4], ["Fork", "fork", 77.2]] },
+    { title: "Rebuild after editing a core crate", note: "Edit nsh-core, which most of the workspace depends on, in the second of two worktrees. About as fast as Cargo, the first edit in a new worktree included; Cranelift on nightly.", unit: "s",
+      rows: [["Cargo", "stock", 9.1], ["Fork", "fork", 9.7], ["Fork, nightly", "nightly", 9.2]] },
+    { title: "Undo the edit", note: "The files match a build made before, so the fork reuses it; Cargo compiles the crates again.", unit: "s",
+      rows: [["Cargo", "stock", 8.8], ["Fork", "fork", 3.4], ["Fork, nightly", "nightly", 3.2]] },
   ],
   projectsSetup: "Release builds of Cargo 1.99.0 and this fork, run one after another on the same machine: nsh, then mado (a 330-crate app in its own repository), then mado again from an empty build directory, as a new worktree or after cargo clean would start. One run each.",
   projects: [

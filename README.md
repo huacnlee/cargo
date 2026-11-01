@@ -33,30 +33,40 @@ cargo 1.101.0 (ea4e34c28 2026-10-29) (huacnlee/cargo 0.102.0-1, https://huacnlee
 ## Results
 
 [nsh](https://github.com/longbridge/nsh), a 525-crate workspace, dev build of
-one binary on an 8-core Apple Silicon Mac. Five fresh git worktrees, built one
-after another. One run each with no compiler cache, so expect some noise:
+one binary on an 8-core Apple Silicon Mac, Rust 1.99 stable, no compiler
+cache. Five fresh git worktrees of the same commit, built one after another,
+one run:
 
 | Worktree | Cargo | Disk, all worktrees | This fork | Disk, all worktrees |
 |---|---:|---:|---:|---:|
-| 1 | 272.9 s | 6.6 GB | 233.9 s | 3.9 GB |
-| 2 | 287.4 s | 13.2 GB | 88.9 s | 6.5 GB |
-| 3 | 285.6 s | 19.8 GB | 91.4 s | 9.1 GB |
-| 4 | 277.2 s | 26.4 GB | 87.5 s | 11.7 GB |
-| 5 | 277.4 s | 33.0 GB | 88.7 s | 14.3 GB |
-| **Total** | **23.3 min** | **33.0 GB** | **9.8 min** | **14.3 GB** |
+| 1 | 111.4 s | 6.7 GB | 77.2 s | 3.7 GB |
+| 2 | 106.4 s | 13.4 GB | 5.1 s | 4.0 GB |
+| 3 | 108.6 s | 20.1 GB | 4.8 s | 4.4 GB |
+| 4 | 93.8 s | 26.9 GB | 4.8 s | 4.8 GB |
+| 5 | 87.6 s | 33.6 GB | 4.8 s | 5.1 GB |
+| **Total** | **8.5 min** | **33.6 GB** | **1.6 min** | **5.1 GB** |
 
-Cargo compiles every dependency again in each worktree. The fork compiles them
-once; each later worktree only builds its own workspace crates, about 90 s and
-2.6 GB. The shared build directory stays under its size limit, twice the
-largest build of the last day.
+Cargo compiles everything again in each worktree. The fork compiles it once:
+dependencies are shared, and so are your crates when their files are the
+same, so each later worktree only links its binary. The shared build
+directory stays under its size limit, twice the largest build of the last
+day.
 
-| Rebuild after editing a core crate | Cargo | This fork |
-|---|---:|---:|
-| Stable | 19.1 s | 19.9 s |
-| Nightly, Cranelift | | 21.4 s |
+Editing and undoing in the second of two worktrees, median of three runs:
 
-Rebuilding after an edit is not faster on this workspace, on stable or with
-Cranelift on nightly.
+| Step | Cargo | This fork | Cargo, nightly | This fork, nightly ¹ |
+|---|---:|---:|---:|---:|
+| Edit a core crate | 9.1 s | 9.7 s | 10.4 s | 9.2 s |
+| Edit it again | 8.7 s | 9.8 s | 11.8 s | 9.4 s |
+| Undo the edit | 8.8 s | 3.4 s | 10.4 s | 3.2 s |
+| Disk, both worktrees | 14 GB | 5.6 GB | 14 GB | 4.3 GB |
+
+¹ Cranelift for your crates; Cargo uses LLVM.
+
+An edit rebuilds about as fast as with Cargo on stable, up to a second
+slower, including the first edit in a worktree that took every build from
+another one. Undoing an edit, or switching back to a branch, reuses what was
+built before.
 
 ### Across projects
 
@@ -102,11 +112,11 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   switching back to a branch reuses what it built before. Editing a test or a
   binary rebuilds only that target. Crates with a build script, and crates
   that read their own path (`env!("CARGO_MANIFEST_DIR")`), still build per
-  worktree. On nightly, worktrees also share rustc's incremental caches
-  (`-Zremap-cwd-prefix=.`), so the first edit in a new worktree is
-  incremental too; debug info then records `.` as the compile directory, so
-  start a debugger from the workspace root. On stable each worktree keeps
-  its own.
+  worktree. Worktrees also share rustc's incremental caches, so the first
+  edit in a new worktree is incremental too. For this rustc records `.` as
+  the compile directory (`-Zremap-cwd-prefix=.`; on stable through
+  `RUSTC_BOOTSTRAP=1` with no `#![feature]` allowed), so start a debugger
+  from the workspace root.
 - **It cleans itself.** After a build, at most once an hour, the project's
   units unused for a day are removed, then the least recently used ones until
   it fits twice its largest build of the last day. Shared dependencies are

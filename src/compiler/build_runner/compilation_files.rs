@@ -534,7 +534,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         //
         // See https://rust-lang.zulipchat.com/#narrow/channel/246057-t-cargo/topic/Usage.20of.20-Zno-embed-metadata/near/633481654
         if file_type.crate_type == Some(CrateType::Rlib)
-            && features::is_nightly_toolchain(&bcx.rustc().version)
+            && features::uses_nightly_defaults(&bcx.rustc().version)
             && !features::is_stop_rlib_uplift_opt_out()
         {
             return None;

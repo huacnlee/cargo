@@ -1616,6 +1616,14 @@ pub fn is_nightly_toolchain(rustc_version: &semver::Version) -> bool {
     cargo_nightly && rustc_nightly
 }
 
+/// Whether to use the defaults upstream reserves for a nightly Cargo and
+/// rustc (`-Zembed-metadata=no`, no uplifted rlibs). This fork is never a
+/// nightly Cargo, so a nightly rustc is enough.
+pub fn uses_nightly_defaults(rustc_version: &semver::Version) -> bool {
+    is_nightly_toolchain(rustc_version)
+        || (!is_fork_defaults_opt_out() && matches!(rustc_version.pre.as_str(), "dev" | "nightly"))
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "Temporary opt out that is not part of the public interface"

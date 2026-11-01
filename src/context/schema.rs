@@ -455,6 +455,10 @@ pub struct BuildDirGcConfig {
     /// `"auto"` (the default) is twice the largest build within `max-unused`.
     /// Counts the whole build-dir: every target and profile.
     pub max_size: Option<String>,
+    /// Build units of the build-dir every project shares, and whole project
+    /// build-dirs, not used for longer than this are removed. Defaults to
+    /// 7 days.
+    pub shared_max_unused: Option<String>,
     /// Size limit of the build-dir every project shares for registry and git
     /// dependencies (`{cargo-cache-home}/targets/shared-deps`). Defaults to
     /// 50 GiB; `"none"` disables it.

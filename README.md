@@ -94,11 +94,14 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   build once in `~/.cargo/targets/shared-deps/` and are reused by any project
   that needs the same version, features and profile, the way Go's build cache
   works.
-- **It cleans itself.** After a build, at most once an hour, units unused for
-  a day are removed, then the least recently used units until each project
-  fits twice its largest build of the last day, and the shared dependencies
-  fit 50 GiB. Incremental caches live with their unit, so the crates you are
-  working on keep them. Nothing a running build has locked is removed.
+- **It cleans itself.** After a build, at most once an hour, the project's
+  units unused for a day are removed, then the least recently used ones until
+  it fits twice its largest build of the last day. Shared dependencies are
+  kept for 7 days, so a project you come back to after a weekend still finds
+  them, and fit 50 GiB. Projects no build has used for 7 days (a deleted
+  checkout, a repository you stopped working on) are removed whole.
+  Incremental caches live with their unit, so the crates you are working on
+  keep them. Nothing a running build has locked is removed.
 - **No duplicate object files on macOS.** Debuggers and backtraces read the
   objects inside each rlib, so the loose copies rustc leaves beside it are
   removed.
@@ -107,6 +110,9 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   reuses the result.
 - **Less debug info in dev builds.** Line tables for workspace members, none
   for dependencies. A `debug` setting in your profile still wins.
+- **Metadata stored once on nightly.** An rlib normally carries a copy of its
+  `.rmeta`; on a nightly rustc it no longer does (`-Zembed-metadata=no`, as
+  upstream does for a nightly Cargo), about 30% off the shared dependencies.
 - **Cranelift on nightly.** `cargo build` compiles local crates with Cranelift
   and runs the front end on up to 8 threads (`-Zthreads`). Tests and release
   builds keep LLVM.
@@ -119,6 +125,7 @@ All of these are defaults. To change one:
 max-size = "auto"     # or "15 GiB", "none"
 shared-max-size = "50 GiB"  # shared dependencies; or "none"
 max-unused = "1 day"
+shared-max-unused = "7 days"  # shared dependencies and idle projects
 frequency = "1 hour"  # or "always", "never"
 enabled = true
 ```

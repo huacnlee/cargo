@@ -301,10 +301,11 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
       <li><strong>One build directory per project.</strong> Intermediate files go to <code>~/.cargo/targets/&lt;name&gt;-&lt;hash&gt;/</code>, where the hash comes from the repository's <code>.git</code> directory. Every worktree lands there wherever it is created, reuses compiled dependencies, and only builds its own crates. Binaries still appear in <code>./target</code>.</li>
       <li><strong>Fixed directories.</strong> <code>./target</code> and <code>~/.cargo/targets</code> cannot be moved: <code>--target-dir</code>, <code>CARGO_TARGET_DIR</code>, <code>build.target-dir</code> and <code>build.build-dir</code> are ignored with a warning, so no flag, env var or tool can scatter build output elsewhere.</li>
       <li><strong>Dependencies shared by every project.</strong> Registry and git dependencies build once in <code>~/.cargo/targets/shared-deps/</code> and are reused by any project that needs the same version, features and profile, like Go's build cache.</li>
-      <li><strong>A size limit.</strong> Each project keeps to twice its largest build of the last day; shared dependencies keep to 50 GiB. Units unused for a day are removed, nothing a running build has locked is removed, and the crates you are working on keep their incremental caches.</li>
+      <li><strong>A size limit.</strong> Each project keeps to twice its largest build of the last day, and its units unused for a day are removed. Shared dependencies are kept for 7 days and keep to 50 GiB; a project no build has used for 7 days is removed whole. Nothing a running build has locked is removed, and the crates you are working on keep their incremental caches.</li>
       <li><strong>No duplicate object files on macOS.</strong> Debuggers and backtraces read the objects inside each rlib, so the loose copies beside it are removed.</li>
       <li><strong>Worktrees build at the same time.</strong> Fine-grained locking is on, so parallel agents do not queue on one lock. When two builds need the same dependency at once, one compiles it and the other reuses the result.</li>
       <li><strong>Less debug info in dev builds.</strong> Line tables for your crates, none for dependencies. Backtraces keep file and line. A <code>debug</code> setting in your profile still wins.</li>
+      <li><strong>Metadata stored once on nightly.</strong> An rlib no longer carries a second copy of its <code>.rmeta</code> on a nightly rustc, about 30% off the shared dependencies.</li>
       <li><strong>Cranelift on nightly.</strong> <code>cargo build</code> compiles your crates with Cranelift and runs the compiler front end on up to 8 threads. Tests and release builds keep LLVM. The installer adds the Cranelift component when you have a nightly toolchain.</li>
     </ul>
     <details>
@@ -314,6 +315,7 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
 max-size = "auto"      <span class="prompt"># or "15 GiB", "none"</span>
 shared-max-size = "50 GiB"
 max-unused = "1 day"
+shared-max-unused = "7 days"
 frequency = "1 hour"   <span class="prompt"># or "always", "never"</span>
 enabled = true</pre>
       <p>Set <code>CARGO_SHARED_DEPS=0</code> to keep dependencies in the project's build directory, <code>CARGO_DEV_CRANELIFT=0</code> to keep LLVM on nightly, and <code>CARGO_RUSTC_THREADS=1</code> for a single-threaded front end.</p>

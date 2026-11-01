@@ -94,6 +94,10 @@ pub struct BuildRunner<'a, 'gctx> {
 
     /// Manages locks for build units when fine grain locking is enabled.
     pub lock_manager: Arc<LockManager>,
+
+    /// Path packages whose units are keyed by their files' content, so all
+    /// checkouts of a repository share them.
+    pub shared_units: Option<super::shared_units::SharedUnits>,
 }
 
 impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -135,6 +139,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             failed_scrape_units: Arc::new(Mutex::new(HashSet::default())),
             unused_dep_state: UnusedDepState::new(bcx),
             lock_manager: Arc::new(LockManager::new()),
+            shared_units: None,
         })
     }
 
@@ -457,6 +462,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             .extend(self.bcx.roots.iter().map(|u| u.target.crate_name()));
 
         self.record_units_requiring_metadata();
+        self.shared_units = super::shared_units::SharedUnits::new(self.bcx)?;
 
         let files = CompilationFiles::new(self, host_layout, targets);
         self.files = Some(files);

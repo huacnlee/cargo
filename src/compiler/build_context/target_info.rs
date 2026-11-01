@@ -357,8 +357,9 @@ impl TargetInfo {
 
             let should_embed_metadata = match gctx.cli_unstable().embed_metadata {
                 Some(v) => v,
-                // Enable -Zembed-metadata=no by default if both cargo and rustc are nightly
-                None => !features::is_nightly_toolchain(&rustc.version),
+                // Enable -Zembed-metadata=no by default on a nightly rustc: an
+                // rlib then no longer carries a second copy of its `.rmeta`.
+                None => !features::uses_nightly_defaults(&rustc.version),
             };
 
             return Ok(TargetInfo {

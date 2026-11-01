@@ -23,8 +23,18 @@
 //!
 //! The build-dir shared by all projects for registry and git dependencies
 //! (see [`Workspace::shared_deps_dir`]) is collected the same way, after the
-//! build-dir of the workspace, with its own size limit,
-//! `build.gc.shared-max-size` (50 GiB by default).
+//! build-dir of the workspace, with its own limits: units unused for
+//! `build.gc.shared-max-unused` (7 days by default) are removed, then the least
+//! recently used ones while it is larger than `build.gc.shared-max-size`
+//! (50 GiB by default). Projects use it at different times, so a day without
+//! a build of one project must not throw away its dependencies.
+//!
+//! In the same pass, the build-dirs of other projects in
+//! `{cargo-cache-home}/targets/` that no build has used for
+//! `build.gc.shared-max-unused` are removed whole: nothing else would ever
+//! collect a project that is not built again (a deleted checkout, a repository
+//! you stopped working on), and its dependencies are gone from the shared
+//! build-dir by then anyway.
 //!
 //! Units of the current build are never removed, nor are units another Cargo
 //! holds a lock on (`-Zfine-grain-locking` keeps a shared lock on every unit
@@ -43,6 +53,7 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
+use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
 use crate::util::data_structures::HashSet;
 use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
@@ -52,12 +63,18 @@ use crate::workspace::gc::parse_human_size;
 
 /// Marker touched in every build unit used by a build.
 const LAST_USE_FILE: &str = ".cargo-last-use";
+/// What a path package's unit is built as apart from its files and those of
+/// its dependencies, see [`collect_superseded`].
+const SLOT_FILE: &str = ".cargo-slot";
+/// The checkouts that used a path package's unit, one per line.
+const USERS_FILE: &str = ".cargo-users";
 /// Marker recording when a build-dir was last collected.
 const LAST_GC_FILE: &str = ".cargo-gc-last";
 /// `<unix seconds> <bytes>` lines: what each recent build used.
 const BUILD_SIZES_FILE: &str = ".cargo-gc-sizes";
 
 const DEFAULT_MAX_UNUSED: Duration = Duration::from_secs(24 * 60 * 60);
+const DEFAULT_SHARED_MAX_UNUSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_SHARED_MAX_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 const DEFAULT_FREQUENCY: Duration = Duration::from_secs(60 * 60);
 /// Incremental dirs kept per crate name, the most recently used first.
@@ -77,6 +94,8 @@ enum MaxSize {
 struct GcSettings {
     max_unused: Duration,
     max_size: MaxSize,
+    /// Age limit for the shared build-dir and for whole idle projects.
+    shared_max_unused: Duration,
     /// Limit for the shared build-dir; `Auto` is not used there.
     shared_max_size: MaxSize,
     /// `None` means never collect.
@@ -88,6 +107,7 @@ impl Default for GcSettings {
         GcSettings {
             max_unused: DEFAULT_MAX_UNUSED,
             max_size: MaxSize::Auto,
+            shared_max_unused: DEFAULT_SHARED_MAX_UNUSED,
             shared_max_size: MaxSize::Bytes(DEFAULT_SHARED_MAX_SIZE),
             frequency: Some(DEFAULT_FREQUENCY),
         }
@@ -119,6 +139,10 @@ impl GcSettings {
             Some("none") => MaxSize::None,
             Some(s) => MaxSize::Bytes(parse_human_size(s)?),
         };
+        let shared_max_unused = match cfg.shared_max_unused.as_deref() {
+            None => DEFAULT_SHARED_MAX_UNUSED,
+            Some(s) => span("shared-max-unused", s)?,
+        };
         let shared_max_size = match cfg.shared_max_size.as_deref() {
             None => MaxSize::Bytes(DEFAULT_SHARED_MAX_SIZE),
             Some("none") => MaxSize::None,
@@ -133,6 +157,7 @@ impl GcSettings {
         Ok(Some(GcSettings {
             max_unused,
             max_size,
+            shared_max_unused,
             shared_max_size,
             frequency,
         }))
@@ -172,6 +197,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
     }
 
     let root = build_runner.bcx.ws.build_dir().into_path_unlocked();
+    collect_superseded(build_runner, &live)?;
     let live_bytes = live
         .iter()
         .filter(|d| d.starts_with(&root))
@@ -183,50 +209,151 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
         return Ok(());
     };
     let ws = build_runner.bcx.ws;
-    let mut roots = vec![(ws.build_dir().into_path_unlocked(), settings.max_size)];
-    if files.layouts().any(|l| l.shared_build_dir().is_some()) {
-        if let Some(shared) = ws.shared_deps_dir() {
-            roots.push((shared, settings.shared_max_size));
-        }
+    let mut roots = vec![(root.clone(), settings.max_unused, settings.max_size)];
+    let shared = files
+        .layouts()
+        .any(|l| l.shared_build_dir().is_some())
+        .then(|| ws.shared_deps_dir())
+        .flatten();
+    if let Some(shared) = &shared {
+        roots.push((
+            shared.clone(),
+            settings.shared_max_unused,
+            settings.shared_max_size,
+        ));
     }
 
     let mut removed = Removed::default();
-    for (root, max_size) in roots {
-        let marker = root.join(LAST_GC_FILE);
+    for (dir, max_unused, max_size) in roots {
+        let marker = dir.join(LAST_GC_FILE);
         if age(mtime(&marker)) < frequency {
             continue;
         }
         collect(
-            &root,
+            &dir,
             &live,
             largest_build,
             FileTime::from_system_time(build_start),
             &GcSettings {
+                max_unused,
                 max_size,
                 ..settings
             },
             &mut removed,
         )?;
         touch(&marker, now)?;
+        if Some(&dir) == shared.as_ref()
+            && let Some(targets) = dir.parent()
+        {
+            collect_idle_projects(
+                targets,
+                &[root.as_path(), dir.as_path()],
+                settings.shared_max_unused,
+                &mut removed,
+            )?;
+        }
     }
 
-    if removed.count > 0 {
+    if removed.count > 0 || removed.projects > 0 {
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let mut what = Vec::new();
+        if removed.count > 0 {
+            what.push(format!(
+                "{} stale build unit{}",
+                removed.count,
+                plural(removed.count)
+            ));
+        }
+        if removed.projects > 0 {
+            what.push(format!(
+                "{} idle project{}",
+                removed.projects,
+                plural(removed.projects)
+            ));
+        }
         gctx.shell().status(
             "Cleaned",
             format!(
-                "{} stale build unit{}, {} freed (build.gc)",
-                removed.count,
-                if removed.count == 1 { "" } else { "s" },
-                format!("{:.1}", HumanBytes(removed.bytes)),
+                "{}, {:.1} freed (build.gc)",
+                what.join(" and "),
+                HumanBytes(removed.bytes)
             ),
         )?;
     }
     Ok(())
 }
 
+/// Removes the units the units of path packages in this build replace.
+///
+/// Units of path packages are keyed by the content of their files (see
+/// `shared_units`), and every unit that depends on one by its hash, so an
+/// edit puts the edited crate and everything that depends on it in new
+/// directories. Each unit records its slot (its `-C metadata` and flags, which
+/// edits do not change) and the checkouts that used it, so this removes the other units
+/// in the same slot that no other checkout has used. Those of other worktrees
+/// stay until they move on themselves, or the periodic collection ages them
+/// out.
+fn collect_superseded(
+    build_runner: &BuildRunner<'_, '_>,
+    live: &HashSet<PathBuf>,
+) -> CargoResult<()> {
+    let ws = build_runner.bcx.ws;
+    let Some(checkout) = ws.shared_build_dir_root().map(shared_units::checkout_key) else {
+        return Ok(());
+    };
+    let files = build_runner.files();
+    let mut removed = Removed::default();
+    for unit in build_runner.bcx.unit_graph.keys() {
+        if unit.is_std || !unit.pkg.package_id().source_id().is_path() {
+            continue;
+        }
+        let dir = files.build_unit_dir(unit);
+        if !dir.is_dir() {
+            continue;
+        }
+        // `RUSTFLAGS` change `unit_id` but not `-C metadata`: keep a unit per
+        // set of flags, as Cargo does for other packages.
+        let slot = crate::util::to_hex(crate::util::hash_u64((
+            files.metadata(unit).c_metadata().to_string(),
+            &unit.rustflags,
+            &unit.rustdocflags,
+            build_runner.bcx.extra_args_for(unit),
+        )));
+        if fs::read_to_string(dir.join(SLOT_FILE)).ok().as_deref() != Some(&slot) {
+            paths::write(dir.join(SLOT_FILE), &slot)?;
+        }
+        let users_file = dir.join(USERS_FILE);
+        let users = fs::read_to_string(&users_file).unwrap_or_default();
+        if !users.lines().any(|u| u == checkout) {
+            paths::append(&users_file, format!("{checkout}\n").as_bytes())?;
+        }
+        let Some(pkg_dir) = dir.parent() else {
+            continue;
+        };
+        for sibling in read_dirs(pkg_dir)? {
+            if live.contains(&sibling)
+                || fs::read_to_string(sibling.join(SLOT_FILE)).ok().as_deref() != Some(&slot)
+            {
+                continue;
+            }
+            let users = fs::read_to_string(sibling.join(USERS_FILE)).unwrap_or_default();
+            if users.lines().all(|u| u == checkout) {
+                remove(&sibling, &mut removed)?;
+            }
+        }
+    }
+    debug!(
+        "build.gc removed {} superseded units, {} bytes",
+        removed.count, removed.bytes
+    );
+    Ok(())
+}
+
 #[derive(Default)]
 struct Removed {
     count: usize,
+    /// Whole project build-dirs, see [`collect_idle_projects`].
+    projects: usize,
     bytes: u64,
 }
 
@@ -292,6 +419,7 @@ fn collect(
                 candidates.push(Candidate::new(dir.clone(), *last_use));
             }
         }
+        remove_dangling_out_links(profile);
         for name in ["deps", ".fingerprint"] {
             let dir = profile.join(name);
             if dir.is_dir() {
@@ -345,6 +473,86 @@ fn collect(
             }
         }
     }
+    Ok(())
+}
+
+/// Removes the build-dirs in `targets` (`{cargo-cache-home}/targets/`) that
+/// no build has used for `max_unused`, except `keep`. Only directories Cargo
+/// created (with a `CACHEDIR.TAG`) are considered, and a project a running
+/// build has locked is skipped.
+fn collect_idle_projects(
+    targets: &Path,
+    keep: &[&Path],
+    max_unused: Duration,
+    removed: &mut Removed,
+) -> CargoResult<()> {
+    for dir in read_dirs(targets)? {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // Left over from a removal that was interrupted.
+        if name.starts_with('.') && name.contains(REMOVING_SUFFIX) {
+            let _ = paths::remove_dir_all(&dir);
+            continue;
+        }
+        if name.starts_with('.')
+            || keep.iter().any(|k| *k == dir)
+            || !dir.join("CACHEDIR.TAG").is_file()
+            || age(last_project_use(&dir)?) <= max_unused
+        {
+            continue;
+        }
+        remove_project(targets, &dir, removed)?;
+    }
+    Ok(())
+}
+
+const REMOVING_SUFFIX: &str = ".removing-";
+
+/// When a build last used a project's build-dir. Every build rewrites
+/// `.cargo-gc-sizes`; older build-dirs only have `.cargo-gc-last` and the
+/// directories a build creates entries in.
+fn last_project_use(dir: &Path) -> CargoResult<FileTime> {
+    let mut last = newest_child_mtime(dir);
+    for profile in profile_dirs(dir)? {
+        last = last.max(newest_child_mtime(&profile));
+    }
+    Ok(last)
+}
+
+/// Removes a whole project build-dir unless a build holds one of its
+/// `<profile>/.cargo-build-lock`. It is first renamed away so that a build
+/// starting meanwhile gets a fresh, empty directory.
+fn remove_project(targets: &Path, dir: &Path, removed: &mut Removed) -> CargoResult<()> {
+    let mut _locks = Vec::new();
+    for profile in profile_dirs(dir)? {
+        let Ok(file) = fs::File::open(profile.join(".cargo-build-lock")) else {
+            continue;
+        };
+        match flock::try_lock_exclusive(&file) {
+            Ok(()) => _locks.push(file),
+            Err(fs::TryLockError::WouldBlock) => {
+                debug!("build.gc skipping {}: in use", dir.display());
+                return Ok(());
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
+    let size = cargo_util::du(dir, &[]).unwrap_or(0);
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let trash = targets.join(format!(".{name}{REMOVING_SUFFIX}{}", std::process::id()));
+    debug!("build.gc removing idle project {}", dir.display());
+    // Windows cannot rename a directory with open files, the lock files here.
+    let renamed = fs::rename(dir, &trash).or_else(|_| {
+        _locks.clear();
+        fs::rename(dir, &trash)
+    });
+    if let Err(e) = renamed {
+        debug!("build.gc skipping {}: {e}", dir.display());
+        return Ok(());
+    }
+    drop(_locks);
+    paths::remove_dir_all(&trash)?;
+    removed.projects += 1;
+    removed.bytes += size;
     Ok(())
 }
 
@@ -426,6 +634,21 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     removed.count += 1;
     removed.bytes += size;
     Ok(size)
+}
+
+/// Removes `--out-dir` symlinks whose unit directory is gone, and their
+/// lock files.
+fn remove_dangling_out_links(profile: &Path) {
+    let Ok(entries) = fs::read_dir(profile.join(OUT_LINKS_DIR)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let link = entry.path();
+        if link.is_symlink() && !link.exists() {
+            let _ = fs::remove_file(&link);
+            let _ = fs::remove_file(link.with_extension("lock"));
+        }
+    }
 }
 
 /// The crate name of an `incremental/<crate>-<id>` directory.
@@ -536,6 +759,59 @@ mod tests {
                 Path::new("release")
             ]
         );
+    }
+
+    #[test]
+    fn idle_projects() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-idle-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let old = FileTime::from_unix_time(FileTime::now().unix_seconds() - 8 * 24 * 3600, 0);
+        let project = |name: &str, time: FileTime| {
+            let dir = tmp.join(name);
+            fs::create_dir_all(dir.join("debug/build/foo/0123456789abcdef")).unwrap();
+            for file in ["CACHEDIR.TAG", "debug/.cargo-build-lock"] {
+                fs::write(dir.join(file), "").unwrap();
+                filetime::set_file_mtime(dir.join(file), time).unwrap();
+            }
+            for d in [
+                "debug/build/foo/0123456789abcdef",
+                "debug/build/foo",
+                "debug/build",
+                "debug",
+                "",
+            ] {
+                filetime::set_file_mtime(dir.join(d), time).unwrap();
+            }
+            dir
+        };
+        let idle = project("idle-1", old);
+        let recent = project("recent-1", FileTime::now());
+        let current = project("current-1", old);
+        let locked = project("locked-1", old);
+        let not_cargo = project("other", old);
+        fs::remove_file(not_cargo.join("CACHEDIR.TAG")).unwrap();
+        filetime::set_file_mtime(&not_cargo, old).unwrap();
+        let interrupted = tmp.join(".gone-1.removing-1");
+        fs::create_dir_all(&interrupted).unwrap();
+        let lock = fs::File::open(locked.join("debug/.cargo-build-lock")).unwrap();
+        flock::lock_shared(&lock).unwrap();
+
+        let mut removed = Removed::default();
+        let week = Duration::from_secs(7 * 24 * 3600);
+        collect_idle_projects(&tmp, &[current.as_path()], week, &mut removed).unwrap();
+        drop(lock);
+        let left = |d: &Path| d.exists();
+        let result = (
+            left(&idle),
+            left(&recent),
+            left(&current),
+            left(&locked),
+            left(&not_cargo),
+            left(&interrupted),
+            removed.projects,
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(result, (false, true, true, true, true, false, 1));
     }
 
     #[test]

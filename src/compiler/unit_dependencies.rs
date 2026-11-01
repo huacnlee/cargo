@@ -66,6 +66,11 @@ struct State<'a, 'gctx> {
     /// dependency from a to b was added purely because it was a dev-dependency.
     /// This is used during `connect_run_custom_build_deps`.
     dev_dependency_edges: HashSet<(Unit, Unit)>,
+
+    /// Whether registry and git dependencies go to the build-dir every project
+    /// shares. They are then fully built for `check` and `doc` too, see
+    /// [`check_or_build_mode`].
+    shared_deps: bool,
 }
 
 /// A boolean-like to indicate if a `Unit` is an artifact or not.
@@ -125,6 +130,10 @@ pub fn build_unit_dependencies<'a, 'gctx>(
         interner,
         scrape_units,
         dev_dependency_edges: HashSet::default(),
+        shared_deps: ws.gctx().cli_unstable().build_dir_new_layout
+            && ws.gctx().cli_unstable().fine_grain_locking
+            && ws.shared_deps_dir().is_some()
+            && ws.gctx().get_env_os("CARGO_CHECK_SHARED_DEPS") != Some("0".as_ref()),
     };
 
     let std_unit_deps = calc_deps_of_std(&mut state, std_roots)?;
@@ -322,7 +331,7 @@ fn compute_deps(
             continue;
         };
         let dep_pkg = state.get(dep_pkg_id);
-        let mode = check_or_build_mode(unit.mode, dep_lib);
+        let mode = check_or_build_mode(state, unit.mode, dep_pkg, dep_lib);
         let dep_unit_for = unit_for.with_dependency(unit, dep_lib, unit_for.root_compile_kind());
 
         let manifest_deps = deps.iter().map(|d| (*d).clone()).collect::<Vec<_>>();
@@ -673,7 +682,7 @@ fn compute_deps_doc(
         let dep_pkg = state.get(id);
         // Rustdoc only needs rmeta files for regular dependencies.
         // However, for plugins/proc macros, deps should be built like normal.
-        let mode = check_or_build_mode(unit.mode, dep_lib);
+        let mode = check_or_build_mode(state, unit.mode, dep_pkg, dep_lib);
         let dep_unit_for = unit_for.with_dependency(unit, dep_lib, unit_for.root_compile_kind());
         let lib_unit_dep = new_unit_dep(
             state,
@@ -770,7 +779,7 @@ fn maybe_lib(
         .iter()
         .find(|t| t.is_linkable())
         .map(|t| {
-            let mode = check_or_build_mode(unit.mode, t);
+            let mode = check_or_build_mode(state, unit.mode, &unit.pkg, t);
             let dep_unit_for = unit_for.with_dependency(unit, t, unit_for.root_compile_kind());
             new_unit_dep(
                 state,
@@ -853,10 +862,22 @@ fn dep_build_script(
 }
 
 /// Choose the correct mode for dependencies.
-fn check_or_build_mode(mode: CompileMode, target: &Target) -> CompileMode {
+///
+/// Registry and git dependencies in the shared build-dir are built, not only
+/// checked: their `.rmeta` serves `check`, `clippy`, rust-analyzer and `doc`
+/// as well as it serves pipelined builds, so all of them share one build of
+/// each dependency instead of checking it again and storing a second copy.
+fn check_or_build_mode(
+    state: &State<'_, '_>,
+    mode: CompileMode,
+    pkg: &Package,
+    target: &Target,
+) -> CompileMode {
     match mode {
         CompileMode::Check { .. } | CompileMode::Doc { .. } | CompileMode::Docscrape => {
-            if target.for_host() {
+            if target.for_host()
+                || (state.shared_deps && !state.is_std && !pkg.package_id().source_id().is_path())
+            {
                 // Plugin and proc macro targets should be compiled like
                 // normal.
                 CompileMode::Build

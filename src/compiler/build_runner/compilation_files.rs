@@ -1,6 +1,6 @@
 //! See [`CompilationFiles`].
 
-use crate::util::data_structures::HashMap;
+use crate::util::data_structures::{HashMap, HashSet};
 use std::cell::OnceCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -12,6 +12,7 @@ use tracing::debug;
 
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::layout::BuildDirLayout;
+use crate::compiler::shared_units::OUT_LINKS_DIR;
 use crate::compiler::trim_paths;
 use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
@@ -99,6 +100,11 @@ pub struct Metadata {
     unit_id: UnitHash,
     c_metadata: UnitHash,
     c_extra_filename: bool,
+    /// Name files after `c_metadata` instead of `unit_id`: the unit has a
+    /// directory of its own, and rustc codegens every module again when an
+    /// output file name changes, which `unit_id` does on every edit for
+    /// units keyed by content (see `shared_units`).
+    stable_filename: bool,
     pkg_dir: bool,
 }
 
@@ -115,7 +121,12 @@ impl Metadata {
 
     /// A hash to add to file names through `-C extra-filename`
     pub fn c_extra_filename(&self) -> Option<UnitHash> {
-        self.c_extra_filename.then_some(self.unit_id)
+        let hash = if self.stable_filename {
+            self.c_metadata
+        } else {
+            self.unit_id
+        };
+        self.c_extra_filename.then_some(hash)
     }
 
     /// A hash to add to Cargo directory names
@@ -141,6 +152,10 @@ pub struct CompilationFiles<'a, 'gctx> {
     metas: HashMap<Unit, Metadata>,
     /// For each Unit, a list all files produced.
     outputs: HashMap<Unit, OnceCell<Arc<Vec<OutputFile>>>>,
+    /// Units of path packages when they are keyed by content (see
+    /// `shared_units`): they, or a dependency, get a new directory on every
+    /// edit.
+    content_keyed: HashSet<Unit>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -182,6 +197,14 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             .cloned()
             .map(|unit| (unit, OnceCell::new()))
             .collect();
+        let content_keyed = match &build_runner.shared_units {
+            Some(_) => metas
+                .keys()
+                .filter(|u| !u.is_std && u.pkg.package_id().source_id().is_path())
+                .cloned()
+                .collect(),
+            None => HashSet::default(),
+        };
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -190,6 +213,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             roots: build_runner.bcx.roots.clone(),
             metas,
             outputs,
+            content_keyed,
         }
     }
 
@@ -364,9 +388,15 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// With the new layout it lives in the unit's own directory, so it is
     /// collected together with the unit and kept as long as the unit is.
+    ///
+    /// Units of path packages keyed by content (see `shared_units`), or
+    /// depending on one, get a new directory on every edit, so theirs is in
+    /// the profile's `incremental/`, shared by every checkout (see
+    /// `remap_cwd`).
     pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
         if self.ws.gctx().cli_unstable().build_dir_new_layout
             && !crate::workspace::features::is_fork_defaults_opt_out()
+            && !self.content_keyed.contains(unit)
         {
             self.build_unit_dir(unit).join("incremental")
         } else {
@@ -375,6 +405,42 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
                 .incremental()
                 .to_path_buf()
         }
+    }
+
+    /// Whether rustc should record `.` as its working directory for the
+    /// unit (`-Zremap-cwd-prefix=.`). rustc throws an incremental cache away
+    /// when it was written from another working directory, so without it
+    /// worktrees sharing one would only wipe each other's.
+    pub fn remap_cwd(&self, unit: &Unit) -> bool {
+        self.content_keyed.contains(unit)
+    }
+
+    /// The path rustc is given as `--out-dir` for a unit whose output
+    /// directory changes on every edit: a symlink in `.out/`, shared by every
+    /// checkout and pointed at the output directory before each compile.
+    /// rustc's incremental cache records the output directory, and codegens
+    /// every module again when it changes.
+    pub fn out_dir_link(&self, unit: &Unit) -> Option<PathBuf> {
+        if !cfg!(unix)
+            || unit.mode.is_doc()
+            || unit.mode.is_doc_scrape()
+            || unit.mode.is_doc_test()
+            || unit.artifact.is_true()
+            || !self.content_keyed.contains(unit)
+        {
+            return None;
+        }
+        Some(
+            self.layout(unit.kind)
+                .build_dir()
+                .incremental()
+                .with_file_name(OUT_LINKS_DIR)
+                .join(format!(
+                    "{}-{}",
+                    unit.target.crate_name(),
+                    self.metadata(unit).c_metadata()
+                )),
+        )
     }
 
     /// Directory where timing output should go.
@@ -534,7 +600,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         //
         // See https://rust-lang.zulipchat.com/#narrow/channel/246057-t-cargo/topic/Usage.20of.20-Zno-embed-metadata/near/633481654
         if file_type.crate_type == Some(CrateType::Rlib)
-            && features::is_nightly_toolchain(&bcx.rustc().version)
+            && features::uses_nightly_defaults(&bcx.rustc().version)
             && !features::is_stop_rlib_uplift_opt_out()
         {
             return None;
@@ -893,9 +959,21 @@ fn compute_metadata(
         target_configs_are_different.hash(&mut shared_hasher);
     }
 
+    // Units of path packages in a build-dir shared by several checkouts are
+    // told apart by the checkout, or by the content of the package's files
+    // (see `shared_units`). The content only goes into `unit_id`: keeping it
+    // out of `-C metadata` keeps incremental compilation working across edits.
+    let mut content_hash = None;
     if !unit.is_std && unit.pkg.package_id().source_id().is_path() {
         if let Some(root) = bcx.ws.shared_build_dir_root() {
-            root.hash(&mut shared_hasher);
+            match build_runner
+                .shared_units
+                .as_ref()
+                .and_then(|s| s.content(unit))
+            {
+                Some(content) => content_hash = Some(content.hash),
+                None => root.hash(&mut shared_hasher),
+            }
         }
     }
 
@@ -927,6 +1005,9 @@ fn compute_metadata(
 
     let mut unit_id_hasher = shared_hasher.clone();
     hash_metadata(ws_root, false, &mut unit_id_hasher, unit);
+    if let Some(content_hash) = content_hash {
+        content_hash.hash(&mut unit_id_hasher);
+    }
     // Mix in the target-metadata of all the dependencies of this target.
     let mut dep_unit_id_hashes = deps_metadata.iter().map(|m| m.unit_id).collect::<Vec<_>>();
     dep_unit_id_hashes.sort();
@@ -956,6 +1037,9 @@ fn compute_metadata(
         unit_id,
         c_metadata,
         c_extra_filename,
+        stable_filename: build_runner.shared_units.is_some()
+            && !unit.is_std
+            && unit.pkg.package_id().source_id().is_path(),
         pkg_dir,
     }
 }

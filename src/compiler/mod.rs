@@ -47,6 +47,7 @@ mod lto;
 mod output_depinfo;
 mod output_sbom;
 pub mod rustdoc;
+mod shared_units;
 pub mod standard_lib;
 pub mod timings;
 pub(crate) mod trim_paths;
@@ -410,6 +411,11 @@ fn rustc(
     let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
+    let shared_record = build_runner
+        .shared_units
+        .as_ref()
+        .and_then(|s| s.record(unit, &build_runner.files().build_unit_dir(unit)));
+    let out_dir_link = build_runner.files().out_dir_link(unit);
     let artifact = unit.artifact;
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = if !sbom_files.is_empty() {
@@ -506,6 +512,16 @@ fn rustc(
                 });
             }
         }
+
+        // Held until rustc is done with the link.
+        let _out_dir_lock = match &out_dir_link {
+            Some(link) => {
+                let lock = shared_units::lock_out_dir(link)?;
+                shared_units::point_out_dir(link, &root)?;
+                Some(lock)
+            }
+            None => None,
+        };
 
         state.running(&rustc);
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
@@ -606,7 +622,16 @@ fn rustc(
             })?;
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
-            paths::set_file_time_no_err(dep_info_loc, timestamp);
+            paths::set_file_time_no_err(&dep_info_loc, timestamp);
+            if let Some(record) = &shared_record {
+                record.write(
+                    &rustc_dep_info_loc,
+                    &dep_info_loc,
+                    &pkg_root,
+                    &build_dir,
+                    &ws_root,
+                )?;
+            }
         }
 
         if let Some(prefix) = &loose_objects_prefix {
@@ -1588,8 +1613,21 @@ fn build_base_args(
         cmd.arg("-C").arg("rpath");
     }
 
-    cmd.arg("--out-dir")
-        .arg(&build_runner.files().output_dir(unit));
+    let files = build_runner.files();
+    cmd.arg("--out-dir").arg(
+        files
+            .out_dir_link(unit)
+            .unwrap_or_else(|| files.output_dir(unit)),
+    );
+    if files.remap_cwd(unit) {
+        cmd.arg("-Zremap-cwd-prefix=.");
+        if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev") {
+            // Lets a stable rustc take the flag above. No `#![feature]` is
+            // allowed, so the crate still has to build on stable.
+            cmd.env("RUSTC_BOOTSTRAP", "1");
+            cmd.arg("-Zallow-features=");
+        }
+    }
 
     unit.kind.add_target_arg(cmd);
 

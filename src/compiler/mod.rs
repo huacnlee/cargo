@@ -1621,6 +1621,12 @@ fn build_base_args(
     );
     if files.remap_cwd(unit) {
         cmd.arg("-Zremap-cwd-prefix=.");
+        if !matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev") {
+            // Lets a stable rustc take the flag above. No `#![feature]` is
+            // allowed, so the crate still has to build on stable.
+            cmd.env("RUSTC_BOOTSTRAP", "1");
+            cmd.arg("-Zallow-features=");
+        }
     }
 
     unit.kind.add_target_arg(cmd);

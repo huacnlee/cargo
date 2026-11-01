@@ -66,8 +66,8 @@ fn names_checkout_path(key: &str) -> bool {
     ) || key.starts_with("CARGO_BIN_EXE_")
 }
 
-/// The profile's directory of `--out-dir` symlinks, one directory per
-/// checkout (see `CompilationFiles::out_dir_link`).
+/// The profile's directory of `--out-dir` symlinks (see
+/// `CompilationFiles::out_dir_link`).
 pub const OUT_LINKS_DIR: &str = ".out";
 
 /// Points the `--out-dir` symlink `link` at `dir`, replacing it atomically.
@@ -91,10 +91,6 @@ pub fn point_out_dir(link: &Path, dir: &Path) -> CargoResult<()> {
     let _ = (link, dir);
     Ok(())
 }
-
-/// The directory in `OUT_LINKS_DIR` holding the links every checkout uses
-/// when they share incremental caches.
-pub const SHARED_OUT_LINKS: &str = "shared";
 
 /// Locks an `--out-dir` link for the duration of a compile, so two checkouts
 /// sharing it do not repoint it under each other.
@@ -129,10 +125,6 @@ pub struct SharedUnits {
     /// Identifies this checkout: a hash of the workspace root.
     checkout: String,
     targets: HashMap<(PackageId, Target), UnitContent>,
-    /// rustc is told to record `.` as its working directory
-    /// (`-Zremap-cwd-prefix=.`, nightly only), so an incremental cache one
-    /// checkout wrote is valid in another and worktrees share theirs.
-    cross_checkout_incremental: bool,
 }
 
 impl SharedUnits {
@@ -187,23 +179,12 @@ impl SharedUnits {
             );
         }
         debug!("keying {} path targets by content", targets.len());
-        let cross_checkout_incremental =
-            matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev");
-        Ok(Some(SharedUnits {
-            checkout,
-            targets,
-            cross_checkout_incremental,
-        }))
+        Ok(Some(SharedUnits { checkout, targets }))
     }
 
     /// Identifies this checkout.
     pub fn checkout(&self) -> &str {
         &self.checkout
-    }
-
-    /// Whether worktrees share incremental caches and `--out-dir` links.
-    pub fn cross_checkout_incremental(&self) -> bool {
-        self.cross_checkout_incremental
     }
 
     /// The content the unit is keyed by, if it is.

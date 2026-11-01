@@ -12,7 +12,7 @@ use tracing::debug;
 
 use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::layout::BuildDirLayout;
-use crate::compiler::shared_units::{OUT_LINKS_DIR, SHARED_OUT_LINKS};
+use crate::compiler::shared_units::OUT_LINKS_DIR;
 use crate::compiler::trim_paths;
 use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
@@ -156,9 +156,6 @@ pub struct CompilationFiles<'a, 'gctx> {
     /// `shared_units`): they, or a dependency, get a new directory on every
     /// edit.
     content_keyed: HashSet<Unit>,
-    /// Where `content_keyed` units keep incremental caches and `--out-dir`
-    /// links: this checkout's key, or `None` when every checkout shares them.
-    checkout: Option<String>,
 }
 
 /// Info about a single file emitted by the compiler.
@@ -208,11 +205,6 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
                 .collect(),
             None => HashSet::default(),
         };
-        let checkout = build_runner
-            .shared_units
-            .as_ref()
-            .filter(|s| !s.cross_checkout_incremental())
-            .map(|s| s.checkout().to_string());
         CompilationFiles {
             ws: build_runner.bcx.ws,
             host,
@@ -222,7 +214,6 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
             metas,
             outputs,
             content_keyed,
-            checkout,
         }
     }
 
@@ -400,38 +391,35 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// Units of path packages keyed by content (see `shared_units`), or
     /// depending on one, get a new directory on every edit, so theirs is in
-    /// the profile's `incremental/`. rustc throws a cache away when it was
-    /// written from another working directory, so unless it is told to
-    /// record `.` instead (nightly), each checkout has its own
-    /// `incremental/<checkout>/`, or worktrees would only wipe each other's.
+    /// the profile's `incremental/`, shared by every checkout (see
+    /// `remap_cwd`).
     pub fn incremental_dir(&self, unit: &Unit) -> PathBuf {
-        let profile = self.layout(unit.kind).build_dir().incremental();
-        if !self.ws.gctx().cli_unstable().build_dir_new_layout
-            || crate::workspace::features::is_fork_defaults_opt_out()
+        if self.ws.gctx().cli_unstable().build_dir_new_layout
+            && !crate::workspace::features::is_fork_defaults_opt_out()
+            && !self.content_keyed.contains(unit)
         {
-            profile.to_path_buf()
-        } else if self.content_keyed.contains(unit) {
-            match &self.checkout {
-                Some(checkout) => profile.join(checkout),
-                None => profile.to_path_buf(),
-            }
-        } else {
             self.build_unit_dir(unit).join("incremental")
+        } else {
+            self.layout(unit.kind)
+                .build_dir()
+                .incremental()
+                .to_path_buf()
         }
     }
 
     /// Whether rustc should record `.` as its working directory for the
-    /// unit, so worktrees can share its incremental cache.
+    /// unit (`-Zremap-cwd-prefix=.`). rustc throws an incremental cache away
+    /// when it was written from another working directory, so without it
+    /// worktrees sharing one would only wipe each other's.
     pub fn remap_cwd(&self, unit: &Unit) -> bool {
-        self.checkout.is_none() && self.content_keyed.contains(unit)
+        self.content_keyed.contains(unit)
     }
 
     /// The path rustc is given as `--out-dir` for a unit whose output
-    /// directory changes on every edit: a symlink in `.out/<checkout>/`, or
-    /// `.out/shared/` when checkouts share incremental caches, pointed at the
-    /// output directory before each compile. rustc's incremental cache
-    /// records the output directory, and codegens every module again when it
-    /// changes.
+    /// directory changes on every edit: a symlink in `.out/`, shared by every
+    /// checkout and pointed at the output directory before each compile.
+    /// rustc's incremental cache records the output directory, and codegens
+    /// every module again when it changes.
     pub fn out_dir_link(&self, unit: &Unit) -> Option<PathBuf> {
         if !cfg!(unix)
             || unit.mode.is_doc()
@@ -442,13 +430,11 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         {
             return None;
         }
-        let checkout = self.checkout.as_deref().unwrap_or(SHARED_OUT_LINKS);
         Some(
             self.layout(unit.kind)
                 .build_dir()
                 .incremental()
                 .with_file_name(OUT_LINKS_DIR)
-                .join(checkout)
                 .join(format!(
                     "{}-{}",
                     unit.target.crate_name(),

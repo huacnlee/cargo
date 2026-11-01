@@ -398,7 +398,7 @@ fn collect(
         // rustc names these after the crate's `StableCrateId`, which Cargo does
         // not know, so they are aged by when rustc last wrote a session into
         // them. Anything written during this build belongs to it.
-        let mut incremental = incremental_dirs(&profile.join("incremental"))?
+        let mut incremental = read_dirs(&profile.join("incremental"))?
             .into_iter()
             .map(|dir| {
                 let last_use = newest_child_mtime(&dir);
@@ -406,14 +406,12 @@ fn collect(
             })
             .collect::<Vec<_>>();
         incremental.sort_by(|(a, a_use), (b, b_use)| {
-            (a.parent(), crate_name(a))
-                .cmp(&(b.parent(), crate_name(b)))
-                .then(b_use.cmp(a_use))
+            crate_name(a).cmp(crate_name(b)).then(b_use.cmp(a_use))
         });
         for (i, (dir, last_use)) in incremental.iter().enumerate() {
             let rank = incremental[..i]
                 .iter()
-                .filter(|(d, _)| d.parent() == dir.parent() && crate_name(d) == crate_name(dir))
+                .filter(|(d, _)| crate_name(d) == crate_name(dir))
                 .count();
             if rank >= KEEP_INCREMENTAL {
                 remove(dir, removed)?;
@@ -638,45 +636,18 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     Ok(size)
 }
 
-/// The `incremental/<crate>-<id>` directories, including those in a
-/// checkout's own `incremental/<checkout>/` (see
-/// `CompilationFiles::incremental_dir`). Empty checkout directories are
-/// removed.
-fn incremental_dirs(dir: &Path) -> CargoResult<Vec<PathBuf>> {
-    let mut dirs = Vec::new();
-    for entry in read_dirs(dir)? {
-        let is_checkout = entry
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| !n.contains('-'));
-        if !is_checkout {
-            dirs.push(entry);
-            continue;
-        }
-        let inner = read_dirs(&entry)?;
-        if inner.is_empty() {
-            let _ = fs::remove_dir(&entry);
-        }
-        dirs.extend(inner);
-    }
-    Ok(dirs)
-}
-
-/// Removes `--out-dir` symlinks whose unit directory is gone.
+/// Removes `--out-dir` symlinks whose unit directory is gone, and their
+/// lock files.
 fn remove_dangling_out_links(profile: &Path) {
-    let Ok(checkouts) = read_dirs(&profile.join(OUT_LINKS_DIR)) else {
+    let Ok(entries) = fs::read_dir(profile.join(OUT_LINKS_DIR)) else {
         return;
     };
-    for checkout in checkouts {
-        if let Ok(entries) = fs::read_dir(&checkout) {
-            for entry in entries.flatten() {
-                let link = entry.path();
-                if link.is_symlink() && !link.exists() {
-                    let _ = fs::remove_file(&link);
-                }
-            }
+    for entry in entries.flatten() {
+        let link = entry.path();
+        if link.is_symlink() && !link.exists() {
+            let _ = fs::remove_file(&link);
+            let _ = fs::remove_file(link.with_extension("lock"));
         }
-        let _ = fs::remove_dir(&checkout);
     }
 }
 

@@ -291,7 +291,9 @@ fn stable_crates_cannot_use_features() {
     let (p, _wt) = repo_with_worktree("#![feature(rustc_attrs)] fn main() {}");
     fork_cargo(&p, "build")
         .with_status(101)
-        .with_stderr_contains("[..]the feature `rustc_attrs` is not in the list of allowed features")
+        .with_stderr_contains(
+            "[..]the feature `rustc_attrs` is not in the list of allowed features",
+        )
         .run();
 }
 

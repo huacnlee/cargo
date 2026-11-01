@@ -364,7 +364,8 @@ mod tests {
 
     #[test]
     fn files_of_a_target() {
-        let p = |s: &str| PathBuf::from("/p").join(s);
+        let root = if cfg!(windows) { r"C:\p" } else { "/p" };
+        let p = |s: &str| PathBuf::from(root).join(s);
         let lib = Target::lib_target(
             "p",
             vec![CrateType::Lib],

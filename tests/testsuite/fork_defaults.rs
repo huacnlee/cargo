@@ -207,7 +207,7 @@ fn worktrees_share_workspace_units() {
 [COMPILING] bar v0.5.0 ([ROOT]/wt/bar)
 [COMPILING] foo v0.1.0 ([ROOT]/wt)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `target/debug/foo`
+[RUNNING] `target/debug/foo[EXE]`
 
 "#]])
         .run();
@@ -215,7 +215,7 @@ fn worktrees_share_workspace_units() {
         .with_stdout_data("1\n")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `target/debug/foo`
+[RUNNING] `target/debug/foo[EXE]`
 
 "#]])
         .run();
@@ -227,7 +227,7 @@ fn worktrees_share_workspace_units() {
         .with_stdout_data("1\n")
         .with_stderr_data(str![[r#"
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `target/debug/foo`
+[RUNNING] `target/debug/foo[EXE]`
 
 "#]])
         .run();
@@ -265,9 +265,13 @@ fn worktrees_share_incremental_caches() {
         .cwd(&wt)
         .env("CARGO_INCREMENTAL", "1")
         .arg("-v")
-        .with_stderr_contains(
-            "[..]--out-dir [ROOT]/home/.cargo/targets/foo-[..]/debug/.out/bar-[..] -Zremap-cwd-prefix=.[..]",
+        .with_stderr_contains("[..] -Zremap-cwd-prefix=.[..]");
+    if cfg!(unix) {
+        // rustc writes through a link that stays the same across edits.
+        build.with_stderr_contains(
+            "[..]--out-dir [ROOT]/home/.cargo/targets/foo-[..]/debug/.out/bar-[..]",
         );
+    }
     if !cargo_test_support::is_nightly() {
         build.with_stderr_contains("[..] -Zallow-features= [..]");
     }
@@ -317,7 +321,7 @@ fn crates_reading_their_path_are_not_shared() {
         .with_stderr_data(str![[r#"
 [COMPILING] foo v0.1.0 ([ROOT]/wt)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
-[RUNNING] `target/debug/foo`
+[RUNNING] `target/debug/foo[EXE]`
 
 "#]])
         .run();

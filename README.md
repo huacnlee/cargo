@@ -93,7 +93,9 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
 - **Dependencies are shared by every project.** Registry and git dependencies
   build once in `~/.cargo/targets/shared-deps/` and are reused by any project
   that needs the same version, features and profile, the way Go's build cache
-  works.
+  works. `cargo check`, clippy, rust-analyzer and `cargo doc` use the same
+  builds instead of checking each dependency again: after a build, a check
+  only looks at your own crates.
 - **It cleans itself.** After a build, at most once an hour, the project's
   units unused for a day are removed, then the least recently used ones until
   it fits twice its largest build of the last day. Shared dependencies are
@@ -131,6 +133,7 @@ enabled = true
 ```
 
 `CARGO_SHARED_DEPS=0` keeps dependencies in the project's build directory;
+`CARGO_CHECK_SHARED_DEPS=0` only checks them in `cargo check`;
 `CARGO_DEV_CRANELIFT=0` keeps LLVM on nightly; `CARGO_RUSTC_THREADS=1` makes
 the front end single-threaded.
 

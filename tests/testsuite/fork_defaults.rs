@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::prelude::*;
+use cargo_test_support::registry::Package;
 use cargo_test_support::{Execs, Project, paths, project, str};
 
 fn fork_cargo(p: &Project, args: &str) -> Execs {
@@ -91,4 +92,58 @@ fn gc_records_build_sizes() {
 
     let sizes = fs::read_to_string(shared_build_dir().join(".cargo-gc-sizes")).unwrap();
     assert_eq!(sizes.lines().count(), 2, "{sizes}");
+}
+
+#[cargo_test]
+fn check_and_build_share_registry_dependencies() {
+    Package::new("bar", "1.0.0")
+        .file("src/lib.rs", "pub fn bar() {}")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+
+            [dependencies]
+            bar = "1.0"
+            "#,
+        )
+        .file("src/main.rs", "fn main() { bar::bar(); }")
+        .build();
+
+    // `bar` is built, not only checked, so the build below reuses it.
+    fork_cargo(&p, "check")
+        .with_stderr_data(str![[r#"
+[UPDATING] `dummy-registry` index
+[LOCKING] 1 package to highest compatible version
+[DOWNLOADING] crates ...
+[DOWNLOADED] bar v1.0.0 (registry `dummy-registry`)
+[COMPILING] bar v1.0.0
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    // Opting out checks it again.
+    fork_cargo(&p, "check")
+        .env("CARGO_CHECK_SHARED_DEPS", "0")
+        .with_stderr_data(str![[r#"
+[CHECKING] bar v1.0.0
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
 }

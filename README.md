@@ -102,7 +102,11 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   switching back to a branch reuses what it built before. Editing a test or a
   binary rebuilds only that target. Crates with a build script, and crates
   that read their own path (`env!("CARGO_MANIFEST_DIR")`), still build per
-  worktree.
+  worktree. On nightly, worktrees also share rustc's incremental caches
+  (`-Zremap-cwd-prefix=.`), so the first edit in a new worktree is
+  incremental too; debug info then records `.` as the compile directory, so
+  start a debugger from the workspace root. On stable each worktree keeps
+  its own.
 - **It cleans itself.** After a build, at most once an hour, the project's
   units unused for a day are removed, then the least recently used ones until
   it fits twice its largest build of the last day. Shared dependencies are

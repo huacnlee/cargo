@@ -92,6 +92,26 @@ pub fn point_out_dir(link: &Path, dir: &Path) -> CargoResult<()> {
     Ok(())
 }
 
+/// The directory in `OUT_LINKS_DIR` holding the links every checkout uses
+/// when they share incremental caches.
+pub const SHARED_OUT_LINKS: &str = "shared";
+
+/// Locks an `--out-dir` link for the duration of a compile, so two checkouts
+/// sharing it do not repoint it under each other.
+pub fn lock_out_dir(link: &Path) -> CargoResult<fs::File> {
+    let path = link.with_extension("lock");
+    paths::create_dir_all(path.parent().expect("out-dir link has a parent"))?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("failed to open `{}`", path.display()))?;
+    crate::util::flock::lock_exclusive(&file)
+        .with_context(|| format!("failed to lock `{}`", path.display()))?;
+    Ok(file)
+}
+
 /// Identifies a checkout in `.cargo-checkout` and `.cargo-users` files.
 pub fn checkout_key(root: &Path) -> String {
     short_hash(&root)
@@ -109,6 +129,10 @@ pub struct SharedUnits {
     /// Identifies this checkout: a hash of the workspace root.
     checkout: String,
     targets: HashMap<(PackageId, Target), UnitContent>,
+    /// rustc is told to record `.` as its working directory
+    /// (`-Zremap-cwd-prefix=.`, nightly only), so an incremental cache one
+    /// checkout wrote is valid in another and worktrees share theirs.
+    cross_checkout_incremental: bool,
 }
 
 impl SharedUnits {
@@ -163,12 +187,23 @@ impl SharedUnits {
             );
         }
         debug!("keying {} path targets by content", targets.len());
-        Ok(Some(SharedUnits { checkout, targets }))
+        let cross_checkout_incremental =
+            matches!(bcx.rustc().version.pre.as_str(), "nightly" | "dev");
+        Ok(Some(SharedUnits {
+            checkout,
+            targets,
+            cross_checkout_incremental,
+        }))
     }
 
     /// Identifies this checkout.
     pub fn checkout(&self) -> &str {
         &self.checkout
+    }
+
+    /// Whether worktrees share incremental caches and `--out-dir` links.
+    pub fn cross_checkout_incremental(&self) -> bool {
+        self.cross_checkout_incremental
     }
 
     /// The content the unit is keyed by, if it is.

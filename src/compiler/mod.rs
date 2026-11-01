@@ -513,9 +513,15 @@ fn rustc(
             }
         }
 
-        if let Some(link) = &out_dir_link {
-            shared_units::point_out_dir(link, &root)?;
-        }
+        // Held until rustc is done with the link.
+        let _out_dir_lock = match &out_dir_link {
+            Some(link) => {
+                let lock = shared_units::lock_out_dir(link)?;
+                shared_units::point_out_dir(link, &root)?;
+                Some(lock)
+            }
+            None => None,
+        };
 
         state.running(&rustc);
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
@@ -1613,6 +1619,9 @@ fn build_base_args(
             .out_dir_link(unit)
             .unwrap_or_else(|| files.output_dir(unit)),
     );
+    if files.remap_cwd(unit) {
+        cmd.arg("-Zremap-cwd-prefix=.");
+    }
 
     unit.kind.add_target_arg(cmd);
 

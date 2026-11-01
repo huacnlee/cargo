@@ -3,7 +3,7 @@
 //! `__CARGO_FORK_DEFAULTS_OPT_OUT=1`; these tests remove it.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::prelude::*;
 use cargo_test_support::registry::Package;
@@ -253,6 +253,71 @@ fn worktrees_share_workspace_units() {
 
 "#]])
         .run();
+}
+
+/// The `bar-<id>` incremental directories of `dir`'s children: one per
+/// checkout, or `dir` itself when checkouts share them.
+fn incremental_homes(incremental: &Path) -> Vec<String> {
+    let mut homes = fs::read_dir(incremental)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .flat_map(|d| {
+            let name = d.file_name().unwrap().to_str().unwrap().to_owned();
+            if name.starts_with("bar-") {
+                vec![".".to_owned()]
+            } else if name.contains('-') {
+                vec![]
+            } else {
+                fs::read_dir(&d)
+                    .unwrap()
+                    .filter(|e| {
+                        let n = e.as_ref().unwrap().file_name();
+                        n.to_str().unwrap().starts_with("bar-")
+                    })
+                    .map(|_| "checkout".to_owned())
+                    .collect()
+            }
+        })
+        .collect::<Vec<_>>();
+    homes.sort();
+    homes
+}
+
+#[cargo_test]
+fn worktrees_keep_own_incremental_caches() {
+    if cargo_test_support::is_nightly() {
+        // Covered by `worktrees_share_incremental_caches_on_nightly`.
+        return;
+    }
+    let (p, wt) = repo_with_worktree("fn main() { bar::bar(); }");
+    fork_cargo(&p, "build").env("CARGO_INCREMENTAL", "1").run();
+    fs::write(wt.join("bar/src/lib.rs"), "pub fn bar() -> u32 { 2 }").unwrap();
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .env("CARGO_INCREMENTAL", "1")
+        .arg("-v")
+        .with_stderr_contains(
+            "[..]--out-dir [ROOT]/home/.cargo/targets/foo-[..]/debug/.out/[..]/bar-[..]",
+        )
+        .with_stderr_does_not_contain("[..]remap-cwd-prefix[..]")
+        .run();
+    let incremental = shared_build_dir().join("debug/incremental");
+    assert_eq!(incremental_homes(&incremental), ["checkout", "checkout"]);
+}
+
+#[cargo_test(nightly, reason = "-Zremap-cwd-prefix is unstable")]
+fn worktrees_share_incremental_caches_on_nightly() {
+    let (p, wt) = repo_with_worktree("fn main() { bar::bar(); }");
+    fork_cargo(&p, "build").env("CARGO_INCREMENTAL", "1").run();
+    fs::write(wt.join("bar/src/lib.rs"), "pub fn bar() -> u32 { 2 }").unwrap();
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .env("CARGO_INCREMENTAL", "1")
+        .arg("-v")
+        .with_stderr_contains("[..]--out-dir [ROOT]/home/.cargo/targets/foo-[..]/debug/.out/shared/bar-[..]-Zremap-cwd-prefix=.[..]")
+        .run();
+    let incremental = shared_build_dir().join("debug/incremental");
+    assert_eq!(incremental_homes(&incremental), ["."]);
 }
 
 #[cargo_test]

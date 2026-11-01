@@ -80,6 +80,9 @@ jobs:
       CARGO_BUILD_WARNINGS: deny
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+      - name: Link rustup proxies into ~/.cargo/bin
+        if: runner.os == 'macOS'
+        run: ci/link-rustup-proxies.sh
       - run: rustup update stable && rustup default stable
       - run: rustup component add clippy
       - run: cargo clippy --workspace --all-targets --no-deps --keep-going
@@ -196,6 +199,9 @@ jobs:
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
     - name: Dump Environment
       run: ci/dump-environment.sh
+    - name: Link rustup proxies into ~/.cargo/bin
+      if: runner.os == 'macOS'
+      run: ci/link-rustup-proxies.sh
     # Some tests require stable. Make sure it is set to the most recent stable
     # so that we can predictably handle updates if necessary (and not randomly
     # when GitHub updates its image).

@@ -96,14 +96,21 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   works. `cargo check`, clippy, rust-analyzer and `cargo doc` use the same
   builds instead of checking each dependency again: after a build, a check
   only looks at your own crates.
+- **Your own crates are shared by worktrees too.** A workspace crate is keyed
+  by the content of its files instead of the checkout it is in, so a new
+  worktree of the same commit reuses every crate another worktree built, and
+  switching back to a branch reuses what it built before. Editing a test or a
+  binary rebuilds only that target. Crates with a build script, and crates
+  that read their own path (`env!("CARGO_MANIFEST_DIR")`), still build per
+  worktree.
 - **It cleans itself.** After a build, at most once an hour, the project's
   units unused for a day are removed, then the least recently used ones until
   it fits twice its largest build of the last day. Shared dependencies are
   kept for 7 days, so a project you come back to after a weekend still finds
   them, and fit 50 GiB. Projects no build has used for 7 days (a deleted
   checkout, a repository you stopped working on) are removed whole.
-  Incremental caches live with their unit, so the crates you are working on
-  keep them. Nothing a running build has locked is removed.
+  The units an edit replaces are removed right away, unless another worktree
+  uses them. Nothing a running build has locked is removed.
 - **No duplicate object files on macOS.** Debuggers and backtraces read the
   objects inside each rlib, so the loose copies rustc leaves beside it are
   removed.
@@ -134,6 +141,7 @@ enabled = true
 
 `CARGO_SHARED_DEPS=0` keeps dependencies in the project's build directory;
 `CARGO_CHECK_SHARED_DEPS=0` only checks them in `cargo check`;
+`CARGO_SHARE_WORKSPACE_UNITS=0` builds your crates per worktree;
 `CARGO_DEV_CRANELIFT=0` keeps LLVM on nightly; `CARGO_RUSTC_THREADS=1` makes
 the front end single-threaded.
 

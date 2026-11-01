@@ -380,7 +380,7 @@ mod dep_info;
 mod dirty_reason;
 mod rustdoc;
 
-use crate::util::data_structures::HashMap;
+use crate::util::data_structures::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::ffi::OsString;
@@ -402,6 +402,7 @@ use serde::ser;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
+use crate::compiler::shared_units::Reuse;
 use crate::compiler::unit_graph::UnitDep;
 use crate::context::FingerprintMethod;
 use crate::util;
@@ -944,6 +945,7 @@ impl LocalFingerprint {
         ws_root: &Path,
         cargo_exe: &Path,
         gctx: &GlobalContext,
+        shared_files: Option<&HashSet<PathBuf>>,
     ) -> CargoResult<Option<StaleItem>> {
         let pkg_root = pkg.root();
         match self {
@@ -958,9 +960,15 @@ impl LocalFingerprint {
                 fingerprint,
             } => {
                 let dep_info = build_root.join(dep_info);
-                let Some(info) = parse_dep_info(pkg_root, build_root, ws_root, &dep_info)? else {
+                let Some(mut info) = parse_dep_info(pkg_root, build_root, ws_root, &dep_info)?
+                else {
                     return Ok(Some(StaleItem::MissingFile { path: dep_info }));
                 };
+                // Built by another checkout from the same package files (see
+                // `shared_units`): their content is known to match.
+                if let Some(shared_files) = shared_files {
+                    info.files.retain(|file, _| !shared_files.contains(file));
+                }
                 for (key, previous) in info.env.iter() {
                     if let Some(value) = pkg.manifest().metadata().env_var(key.as_str()) {
                         if Some(value.as_ref()) == previous.as_deref() {
@@ -1262,6 +1270,7 @@ impl Fingerprint {
         ws_root: &Path,
         cargo_exe: &Path,
         gctx: &GlobalContext,
+        shared_files: Option<&HashSet<PathBuf>>,
     ) -> CargoResult<()> {
         assert!(!self.fs_status.up_to_date());
 
@@ -1372,6 +1381,7 @@ impl Fingerprint {
                 ws_root,
                 cargo_exe,
                 gctx,
+                shared_files,
             )? {
                 item.log();
                 self.fs_status = FsStatus::StaleItem(item);
@@ -1561,15 +1571,31 @@ fn calculate(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
     let build_root = build_root(build_runner, unit);
     let ws_root = build_runner.bcx.ws.root();
     let cargo_exe = build_runner.bcx.gctx.cargo_exe()?;
-    fingerprint.check_filesystem(
-        &mut build_runner.mtime_cache,
-        &mut build_runner.checksum_cache,
-        &unit.pkg,
-        &build_root,
-        ws_root,
-        cargo_exe,
-        build_runner.bcx.gctx,
-    )?;
+    let reuse = build_runner
+        .shared_units
+        .as_ref()
+        .and_then(|s| s.reuse(unit, &build_runner.files().build_unit_dir(unit)));
+    match reuse {
+        Some(Reuse::Rebuild(marker)) => {
+            fingerprint.fs_status = FsStatus::StaleItem(StaleItem::MissingFile { path: marker });
+        }
+        reuse => {
+            let shared_files = match &reuse {
+                Some(Reuse::Content(files)) => Some(&**files),
+                _ => None,
+            };
+            fingerprint.check_filesystem(
+                &mut build_runner.mtime_cache,
+                &mut build_runner.checksum_cache,
+                &unit.pkg,
+                &build_root,
+                ws_root,
+                cargo_exe,
+                build_runner.bcx.gctx,
+                shared_files,
+            )?;
+        }
+    }
 
     let fingerprint = Arc::new(fingerprint);
     build_runner

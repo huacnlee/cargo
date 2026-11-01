@@ -53,6 +53,7 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
+use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
 use crate::util::data_structures::HashSet;
 use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
@@ -62,6 +63,11 @@ use crate::workspace::gc::parse_human_size;
 
 /// Marker touched in every build unit used by a build.
 const LAST_USE_FILE: &str = ".cargo-last-use";
+/// What a path package's unit is built as apart from its files and those of
+/// its dependencies, see [`collect_superseded`].
+const SLOT_FILE: &str = ".cargo-slot";
+/// The checkouts that used a path package's unit, one per line.
+const USERS_FILE: &str = ".cargo-users";
 /// Marker recording when a build-dir was last collected.
 const LAST_GC_FILE: &str = ".cargo-gc-last";
 /// `<unix seconds> <bytes>` lines: what each recent build used.
@@ -191,6 +197,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
     }
 
     let root = build_runner.bcx.ws.build_dir().into_path_unlocked();
+    collect_superseded(build_runner, &live)?;
     let live_bytes = live
         .iter()
         .filter(|d| d.starts_with(&root))
@@ -276,6 +283,72 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
     Ok(())
 }
 
+/// Removes the units the units of path packages in this build replace.
+///
+/// Units of path packages are keyed by the content of their files (see
+/// `shared_units`), and every unit that depends on one by its hash, so an
+/// edit puts the edited crate and everything that depends on it in new
+/// directories. Each unit records its slot (its `-C metadata` and flags, which
+/// edits do not change) and the checkouts that used it, so this removes the other units
+/// in the same slot that no other checkout has used. Those of other worktrees
+/// stay until they move on themselves, or the periodic collection ages them
+/// out.
+fn collect_superseded(
+    build_runner: &BuildRunner<'_, '_>,
+    live: &HashSet<PathBuf>,
+) -> CargoResult<()> {
+    let ws = build_runner.bcx.ws;
+    let Some(checkout) = ws.shared_build_dir_root().map(shared_units::checkout_key) else {
+        return Ok(());
+    };
+    let files = build_runner.files();
+    let mut removed = Removed::default();
+    for unit in build_runner.bcx.unit_graph.keys() {
+        if unit.is_std || !unit.pkg.package_id().source_id().is_path() {
+            continue;
+        }
+        let dir = files.build_unit_dir(unit);
+        if !dir.is_dir() {
+            continue;
+        }
+        // `RUSTFLAGS` change `unit_id` but not `-C metadata`: keep a unit per
+        // set of flags, as Cargo does for other packages.
+        let slot = crate::util::to_hex(crate::util::hash_u64((
+            files.metadata(unit).c_metadata().to_string(),
+            &unit.rustflags,
+            &unit.rustdocflags,
+            build_runner.bcx.extra_args_for(unit),
+        )));
+        if fs::read_to_string(dir.join(SLOT_FILE)).ok().as_deref() != Some(&slot) {
+            paths::write(dir.join(SLOT_FILE), &slot)?;
+        }
+        let users_file = dir.join(USERS_FILE);
+        let users = fs::read_to_string(&users_file).unwrap_or_default();
+        if !users.lines().any(|u| u == checkout) {
+            paths::append(&users_file, format!("{checkout}\n").as_bytes())?;
+        }
+        let Some(pkg_dir) = dir.parent() else {
+            continue;
+        };
+        for sibling in read_dirs(pkg_dir)? {
+            if live.contains(&sibling)
+                || fs::read_to_string(sibling.join(SLOT_FILE)).ok().as_deref() != Some(&slot)
+            {
+                continue;
+            }
+            let users = fs::read_to_string(sibling.join(USERS_FILE)).unwrap_or_default();
+            if users.lines().all(|u| u == checkout) {
+                remove(&sibling, &mut removed)?;
+            }
+        }
+    }
+    debug!(
+        "build.gc removed {} superseded units, {} bytes",
+        removed.count, removed.bytes
+    );
+    Ok(())
+}
+
 #[derive(Default)]
 struct Removed {
     count: usize,
@@ -325,7 +398,7 @@ fn collect(
         // rustc names these after the crate's `StableCrateId`, which Cargo does
         // not know, so they are aged by when rustc last wrote a session into
         // them. Anything written during this build belongs to it.
-        let mut incremental = read_dirs(&profile.join("incremental"))?
+        let mut incremental = incremental_dirs(&profile.join("incremental"))?
             .into_iter()
             .map(|dir| {
                 let last_use = newest_child_mtime(&dir);
@@ -333,12 +406,14 @@ fn collect(
             })
             .collect::<Vec<_>>();
         incremental.sort_by(|(a, a_use), (b, b_use)| {
-            crate_name(a).cmp(crate_name(b)).then(b_use.cmp(a_use))
+            (a.parent(), crate_name(a))
+                .cmp(&(b.parent(), crate_name(b)))
+                .then(b_use.cmp(a_use))
         });
         for (i, (dir, last_use)) in incremental.iter().enumerate() {
             let rank = incremental[..i]
                 .iter()
-                .filter(|(d, _)| crate_name(d) == crate_name(dir))
+                .filter(|(d, _)| d.parent() == dir.parent() && crate_name(d) == crate_name(dir))
                 .count();
             if rank >= KEEP_INCREMENTAL {
                 remove(dir, removed)?;
@@ -346,6 +421,7 @@ fn collect(
                 candidates.push(Candidate::new(dir.clone(), *last_use));
             }
         }
+        remove_dangling_out_links(profile);
         for name in ["deps", ".fingerprint"] {
             let dir = profile.join(name);
             if dir.is_dir() {
@@ -560,6 +636,48 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     removed.count += 1;
     removed.bytes += size;
     Ok(size)
+}
+
+/// The `incremental/<crate>-<id>` directories, including those in a
+/// checkout's own `incremental/<checkout>/` (see
+/// `CompilationFiles::incremental_dir`). Empty checkout directories are
+/// removed.
+fn incremental_dirs(dir: &Path) -> CargoResult<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for entry in read_dirs(dir)? {
+        let is_checkout = entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| !n.contains('-'));
+        if !is_checkout {
+            dirs.push(entry);
+            continue;
+        }
+        let inner = read_dirs(&entry)?;
+        if inner.is_empty() {
+            let _ = fs::remove_dir(&entry);
+        }
+        dirs.extend(inner);
+    }
+    Ok(dirs)
+}
+
+/// Removes `--out-dir` symlinks whose unit directory is gone.
+fn remove_dangling_out_links(profile: &Path) {
+    let Ok(checkouts) = read_dirs(&profile.join(OUT_LINKS_DIR)) else {
+        return;
+    };
+    for checkout in checkouts {
+        if let Ok(entries) = fs::read_dir(&checkout) {
+            for entry in entries.flatten() {
+                let link = entry.path();
+                if link.is_symlink() && !link.exists() {
+                    let _ = fs::remove_file(&link);
+                }
+            }
+        }
+        let _ = fs::remove_dir(&checkout);
+    }
 }
 
 /// The crate name of an `incremental/<crate>-<id>` directory.

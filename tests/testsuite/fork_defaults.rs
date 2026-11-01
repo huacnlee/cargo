@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::prelude::*;
 use cargo_test_support::registry::Package;
-use cargo_test_support::{Execs, Project, paths, project, str};
+use cargo_test_support::{Execs, Project, basic_lib_manifest, git, paths, project, str};
 
 fn fork_cargo(p: &Project, args: &str) -> Execs {
     let mut execs = p.cargo(args);
@@ -143,6 +143,139 @@ fn check_and_build_share_registry_dependencies() {
 [CHECKING] bar v1.0.0
 [CHECKING] foo v0.1.0 ([ROOT]/foo)
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+/// A git repository `foo` with a library member `bar`, and a worktree of it.
+fn repo_with_worktree(main: &str) -> (Project, PathBuf) {
+    let p = git::new("foo", |p| {
+        p.file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+
+            [dependencies]
+            bar = { path = "bar" }
+
+            [workspace]
+            "#,
+        )
+        .file("src/main.rs", main)
+        .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
+        .file("bar/src/lib.rs", "pub fn bar() -> u32 { 1 }")
+        .file("bar/tests/t.rs", "#[test] fn t() {}")
+    });
+    let repo = git2::Repository::open(p.root()).unwrap();
+    let worktree = paths::root().join("wt");
+    repo.worktree("wt", &worktree, Some(&git2::WorktreeAddOptions::new()))
+        .unwrap();
+    (p, worktree)
+}
+
+#[cargo_test]
+fn worktrees_share_workspace_units() {
+    let (p, wt) = repo_with_worktree("fn main() { println!(\"{}\", bar::bar()); }");
+    fork_cargo(&p, "build")
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.5.0 ([ROOT]/foo/bar)
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    // Same files: nothing to build.
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    // An edit in one worktree leaves the other one's units alone.
+    fs::write(wt.join("bar/src/lib.rs"), "pub fn bar() -> u32 { 2 }").unwrap();
+    fork_cargo(&p, "run")
+        .cwd(&wt)
+        .with_stdout_data("2\n")
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.5.0 ([ROOT]/wt/bar)
+[COMPILING] foo v0.1.0 ([ROOT]/wt)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[RUNNING] `target/debug/foo`
+
+"#]])
+        .run();
+    fork_cargo(&p, "run")
+        .with_stdout_data("1\n")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[RUNNING] `target/debug/foo`
+
+"#]])
+        .run();
+
+    // Going back to earlier files reuses their units.
+    fs::write(wt.join("bar/src/lib.rs"), "pub fn bar() -> u32 { 1 }").unwrap();
+    fork_cargo(&p, "run")
+        .cwd(&wt)
+        .with_stdout_data("1\n")
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[RUNNING] `target/debug/foo`
+
+"#]])
+        .run();
+
+    // Editing a test only rebuilds that test.
+    fs::write(wt.join("bar/tests/t.rs"), "#[test] fn t2() {}").unwrap();
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+
+    // Opting out keeps the checkout in the hash.
+    fork_cargo(&p, "build")
+        .cwd(&wt)
+        .env("CARGO_SHARE_WORKSPACE_UNITS", "0")
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.5.0 ([ROOT]/wt/bar)
+[COMPILING] foo v0.1.0 ([ROOT]/wt)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
+fn crates_reading_their_path_are_not_shared() {
+    let (p, wt) = repo_with_worktree(
+        "fn main() { bar::bar(); println!(\"{}\", env!(\"CARGO_MANIFEST_DIR\")); }",
+    );
+    fork_cargo(&p, "run")
+        .with_stdout_data(str![[r#"
+[ROOT]/foo
+
+"#]])
+        .run();
+    fork_cargo(&p, "run")
+        .cwd(&wt)
+        .with_stdout_data(str![[r#"
+[ROOT]/wt
+
+"#]])
+        .with_stderr_data(str![[r#"
+[COMPILING] foo v0.1.0 ([ROOT]/wt)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+[RUNNING] `target/debug/foo`
 
 "#]])
         .run();

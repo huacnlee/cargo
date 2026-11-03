@@ -129,6 +129,7 @@ jobs:
             file stage/cargo | grep -q arm64
           else
             "stage/cargo$([ "$RUNNER_OS" = Windows ] && echo .exe)" --version
+            ci/smoke-installed.sh "stage/cargo$([ "$RUNNER_OS" = Windows ] && echo .exe)"
           fi
           cd dist
           if command -v sha256sum >/dev/null; then sha256sum "$asset"; else shasum -a 256 "$asset"; fi > "$asset.sha256"

@@ -104,10 +104,36 @@ fn detach(cmd: &mut Command) {
 #[cfg(windows)]
 fn detach(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    // Windows passes every inheritable handle to a child, whatever its stdio
+    // is set to. Our stdio is usually the caller's pipe or console, and a
+    // child holding it keeps terminals and IDEs waiting for the update to
+    // finish, so it must not be inherited. This process exits right after.
+    for std in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on this process's standard handles; an
+        // invalid or null handle only makes them fail.
+        unsafe {
+            SetHandleInformation(GetStdHandle(std), HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Keeps console programs started by the detached updater from opening a
+/// console window: it has no console of its own to share.
+fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 fn update(home: &Path) -> CargoResult<String> {
@@ -147,7 +173,7 @@ fn update(home: &Path) -> CargoResult<String> {
     fs::create_dir(&unpacked)?;
     extract(&archive, &unpacked)?;
     let new = unpacked.join(format!("cargo{}", env::consts::EXE_SUFFIX));
-    let ok = Command::new(&new)
+    let ok = no_window(&mut Command::new(&new))
         .arg("--version")
         .env_remove(CHILD_ENV)
         .stdin(Stdio::null())
@@ -259,7 +285,7 @@ fn extract(archive: &Path, into: &Path) -> CargoResult<()> {
 #[cfg(windows)]
 fn extract(archive: &Path, into: &Path) -> CargoResult<()> {
     // Windows 10 and later ship bsdtar, which reads zip files.
-    let status = Command::new("tar")
+    let status = no_window(&mut Command::new("tar"))
         .arg("-xf")
         .arg(archive)
         .arg("-C")

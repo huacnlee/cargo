@@ -124,7 +124,13 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   them, and fit 50 GiB. Projects no build has used for 7 days (a deleted
   checkout, a repository you stopped working on) are removed whole.
   The units an edit replaces are removed right away, unless another worktree
-  uses them. Nothing a running build has locked is removed.
+  uses them. A shared dependency rebuilt because something below it changed
+  (a `cargo update`, another project's lockfile, a new snapshot of a git
+  dependency) keeps only its newest build for the week; the older ones go
+  after a day. Directories in `CARGO_TARGET_TMPDIR` nothing wrote to for a
+  day go too, and so do binaries in `./target` whose build unit was removed
+  (they would otherwise keep its whole size). Nothing a running build has
+  locked is removed.
 - **No duplicate object files on macOS.** Debuggers and backtraces read the
   objects inside each rlib, so the loose copies rustc leaves beside it are
   removed.

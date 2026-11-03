@@ -18,8 +18,16 @@
 //!    * leftovers from the old layout (`deps/`, `.fingerprint/`,
 //!      `build/<pkg>-<hash>/`),
 //!
+//!    * entries of `tmp/` (`CARGO_TARGET_TMPDIR`, which tests write to and
+//!      nothing cleans) unused for `build.gc.max-unused`,
+//!
 //!    then keeps removing the least recently used ones while the build-dir is
 //!    larger than `build.gc.max-size`.
+//! 3. In the same pass, removes the binaries and libraries in the target-dir
+//!    (`./target/<profile>/`) that no build unit holds any more: they are
+//!    hard links to a unit's outputs, so they cost nothing until the unit is
+//!    collected, and then keep its whole size alive. Only files unchanged for
+//!    `build.gc.max-unused` are removed; a build links them again.
 //!
 //! The build-dir shared by all projects for registry and git dependencies
 //! (see [`Workspace::shared_deps_dir`]) is collected the same way, after the
@@ -28,6 +36,14 @@
 //! recently used ones while it is larger than `build.gc.shared-max-size`
 //! (50 GiB by default). Projects use it at different times, so a day without
 //! a build of one project must not throw away its dependencies.
+//!
+//! A dependency is rebuilt in a new unit whenever anything below it changes
+//! (a `cargo update`, another project's lockfile, a new upstream snapshot), so
+//! the shared build-dir collects many variants of the same crate with the same
+//! features and flags. Each unit records that variant (`.cargo-variant`); a
+//! unit whose variant a newer unit has built since is removed after
+//! `build.gc.max-unused` instead of `build.gc.shared-max-unused`. The newest
+//! unit of each variant still waits the full week.
 //!
 //! In the same pass, the build-dirs of other projects in
 //! `{cargo-cache-home}/targets/` that no build has used for
@@ -68,6 +84,9 @@ const LAST_USE_FILE: &str = ".cargo-last-use";
 const SLOT_FILE: &str = ".cargo-slot";
 /// The checkouts that used a path package's unit, one per line.
 const USERS_FILE: &str = ".cargo-users";
+/// The crate, target, features, profile and flags of a shared unit: what
+/// stays the same when only its dependencies change.
+const VARIANT_FILE: &str = ".cargo-variant";
 /// Marker recording when a build-dir was last collected.
 const LAST_GC_FILE: &str = ".cargo-gc-last";
 /// `<unix seconds> <bytes>` lines: what each recent build used.
@@ -198,6 +217,7 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
 
     let root = build_runner.bcx.ws.build_dir().into_path_unlocked();
     collect_superseded(build_runner, &live)?;
+    record_variants(build_runner)?;
     let live_bytes = live
         .iter()
         .filter(|d| d.starts_with(&root))
@@ -209,7 +229,8 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
         return Ok(());
     };
     let ws = build_runner.bcx.ws;
-    let mut roots = vec![(root.clone(), settings.max_unused, settings.max_size)];
+    // (dir, max-unused, max-size, max-unused of a superseded variant)
+    let mut roots = vec![(root.clone(), settings.max_unused, settings.max_size, None)];
     let shared = files
         .layouts()
         .any(|l| l.shared_build_dir().is_some())
@@ -220,11 +241,12 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
             shared.clone(),
             settings.shared_max_unused,
             settings.shared_max_size,
+            Some(settings.max_unused),
         ));
     }
 
     let mut removed = Removed::default();
-    for (dir, max_unused, max_size) in roots {
+    for (dir, max_unused, max_size, superseded_max_unused) in roots {
         let marker = dir.join(LAST_GC_FILE);
         if age(mtime(&marker)) < frequency {
             continue;
@@ -239,8 +261,16 @@ fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> Car
                 max_size,
                 ..settings
             },
+            superseded_max_unused,
             &mut removed,
         )?;
+        if dir == root {
+            collect_orphan_outputs(
+                &ws.target_dir().into_path_unlocked(),
+                settings.max_unused,
+                &mut removed,
+            )?;
+        }
         touch(&marker, now)?;
         if Some(&dir) == shared.as_ref()
             && let Some(targets) = dir.parent()
@@ -349,6 +379,38 @@ fn collect_superseded(
     Ok(())
 }
 
+/// Writes [`VARIANT_FILE`] in every unit of this build that is in the shared
+/// build-dir. `-C metadata` cannot serve: it hashes the dependencies too.
+fn record_variants(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+    let Some(shared) = build_runner.bcx.ws.shared_deps_dir() else {
+        return Ok(());
+    };
+    let files = build_runner.files();
+    for unit in build_runner.bcx.unit_graph.keys() {
+        let dir = files.build_unit_dir(unit);
+        if !dir.starts_with(&shared) || !dir.is_dir() {
+            continue;
+        }
+        let variant = crate::util::to_hex(crate::util::hash_u64((
+            unit.pkg.name().as_str(),
+            unit.pkg.package_id().source_id().is_git(),
+            &unit.target,
+            &unit.mode,
+            &unit.kind,
+            &unit.features,
+            &unit.profile,
+            &unit.rustflags,
+            build_runner.bcx.extra_args_for(unit),
+            &build_runner.bcx.rustc().verbose_version,
+        )));
+        let file = dir.join(VARIANT_FILE);
+        if fs::read_to_string(&file).ok().as_deref() != Some(&variant) {
+            paths::write(&file, &variant)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Removed {
     count: usize,
@@ -376,6 +438,7 @@ fn collect(
     largest_build: u64,
     build_start: FileTime,
     settings: &GcSettings,
+    superseded_max_unused: Option<Duration>,
     removed: &mut Removed,
 ) -> CargoResult<()> {
     let profiles = profile_dirs(root)?;
@@ -386,14 +449,21 @@ fn collect(
                 candidates.push(Candidate::new(pkg.clone(), mtime(&pkg)));
                 continue;
             }
+            let mut units = Vec::new();
             for unit in read_dirs(&pkg)? {
-                if live.contains(&unit) {
-                    continue;
-                }
                 let last_use =
                     mtime(&unit.join(LAST_USE_FILE)).max(mtime(&unit.join("fingerprint")));
-                candidates.push(Candidate::new(unit, last_use));
+                units.push((unit, last_use));
             }
+            if let Some(max_unused) = superseded_max_unused {
+                remove_superseded_variants(&mut units, live, max_unused, removed)?;
+            }
+            candidates.extend(
+                units
+                    .into_iter()
+                    .filter(|(unit, _)| !live.contains(unit))
+                    .map(|(unit, last_use)| Candidate::new(unit, last_use)),
+            );
         }
         // rustc names these after the crate's `StableCrateId`, which Cargo does
         // not know, so they are aged by when rustc last wrote a session into
@@ -428,6 +498,10 @@ fn collect(
         }
     }
 
+    // `CARGO_TARGET_TMPDIR`: tests write there and nothing else cleans it.
+    let tmp = root.join("tmp");
+    tmp_candidates(&tmp, TMP_DEPTH, settings.max_unused, &mut candidates)?;
+
     candidates.sort_by_key(|c| c.last_use);
     let mut kept = Vec::with_capacity(candidates.len());
     for c in candidates {
@@ -453,6 +527,9 @@ fn collect(
                 }
             }
         }
+        if tmp.is_dir() {
+            total += cargo_util::du(&tmp, &[])?;
+        }
         debug!(
             "build-dir {} is {total} bytes (limit {max_size})",
             root.display()
@@ -473,6 +550,143 @@ fn collect(
             }
         }
     }
+    Ok(())
+}
+
+/// How deep [`tmp_candidates`] looks into `tmp/`. A test suite usually keeps
+/// one directory per test a few levels down (Cargo's own:
+/// `tmp/cit/testsuite/<module>/<test>`), and only some of them run again.
+const TMP_DEPTH: usize = 4;
+
+/// Adds the directories in `dir` that nothing was written to for
+/// `max_unused`; looks into the others, `depth` levels at most. Files are
+/// left alone: a directory holding only stale files goes as a whole.
+fn tmp_candidates(
+    dir: &Path,
+    depth: usize,
+    max_unused: Duration,
+    candidates: &mut Vec<Candidate>,
+) -> CargoResult<()> {
+    for entry in read_dirs(dir)? {
+        let last_use = newest_mtime_within(&entry, max_unused);
+        if age(last_use) > max_unused {
+            candidates.push(Candidate::new(entry, last_use));
+        } else if depth > 1 {
+            tmp_candidates(&entry, depth - 1, max_unused, candidates)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes the units of one package (`build/<pkg>/`) that a newer unit of the
+/// same variant ([`VARIANT_FILE`]) has replaced and that no build has used for
+/// `max_unused`, and drops them from `units`.
+fn remove_superseded_variants(
+    units: &mut Vec<(PathBuf, FileTime)>,
+    live: &HashSet<PathBuf>,
+    max_unused: Duration,
+    removed: &mut Removed,
+) -> CargoResult<()> {
+    if units.len() < 2 {
+        return Ok(());
+    }
+    let mut newest: crate::util::data_structures::HashMap<String, FileTime> = Default::default();
+    let variants: Vec<Option<String>> = units
+        .iter()
+        .map(|(unit, last_use)| {
+            let variant = fs::read_to_string(unit.join(VARIANT_FILE)).ok()?;
+            let use_ = if live.contains(unit) {
+                FileTime::now()
+            } else {
+                *last_use
+            };
+            let entry = newest.entry(variant.clone()).or_insert(use_);
+            *entry = (*entry).max(use_);
+            Some(variant)
+        })
+        .collect();
+    let mut kept = Vec::with_capacity(units.len());
+    for ((unit, last_use), variant) in units.drain(..).zip(variants) {
+        let superseded = variant.is_some_and(|v| newest[&v] > last_use)
+            && !live.contains(&unit)
+            && age(last_use) > max_unused;
+        if superseded && remove(&unit, removed)? > 0 {
+            continue;
+        }
+        if unit.exists() {
+            kept.push((unit, last_use));
+        }
+    }
+    *units = kept;
+    Ok(())
+}
+
+/// Removes the outputs Cargo linked into the target-dir
+/// (`[<target>/]<profile>/[examples/]`) that no build unit holds any more and
+/// that have not changed for `max_unused`, with their dep-info files.
+///
+/// Outputs are hard links to a unit's files, so one with a single link is all
+/// that is left of a unit the collector removed. Where Cargo had to copy
+/// instead (another file system), every output has a single link; a build
+/// links those it still needs again.
+fn collect_orphan_outputs(
+    target_dir: &Path,
+    max_unused: Duration,
+    removed: &mut Removed,
+) -> CargoResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // A profile dir is where Cargo keeps its `.cargo-lock`.
+        let mut profiles = Vec::new();
+        for dir in read_dirs(target_dir)? {
+            if dir.join(".cargo-lock").is_file() {
+                profiles.push(dir);
+            } else {
+                profiles.extend(
+                    read_dirs(&dir)?
+                        .into_iter()
+                        .filter(|d| d.join(".cargo-lock").is_file()),
+                );
+            }
+        }
+        for profile in profiles {
+            for dir in [profile.clone(), profile.join("examples")] {
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(meta) = fs::symlink_metadata(&path) else {
+                        continue;
+                    };
+                    if !meta.is_file()
+                        || meta.nlink() != 1
+                        || path.extension().is_some_and(|e| e == "d")
+                        || age(FileTime::from_last_modification_time(&meta)) <= max_unused
+                    {
+                        continue;
+                    }
+                    // Only what Cargo put there: an output has its dep-info.
+                    let Some(stem) = path.file_stem() else {
+                        continue;
+                    };
+                    let dep_info = dir.join(stem).with_extension("d");
+                    if !dep_info.is_file() {
+                        continue;
+                    }
+                    debug!("build.gc removing orphan output {}", path.display());
+                    paths::remove_file(&path)?;
+                    removed.count += 1;
+                    removed.bytes += meta.len();
+                    let _ = fs::remove_file(&dep_info);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (target_dir, max_unused, removed);
     Ok(())
 }
 
@@ -701,6 +915,21 @@ fn newest_child_mtime(dir: &Path) -> FileTime {
     newest
 }
 
+/// The newest modification time of `dir` and everything in it, stopping as
+/// soon as anything is newer than `max_age`: that is all the caller needs.
+fn newest_mtime_within(dir: &Path, max_age: Duration) -> FileTime {
+    let mut newest = mtime(dir);
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        if let Ok(meta) = entry.metadata() {
+            newest = newest.max(FileTime::from_last_modification_time(&meta));
+        }
+        if age(newest) <= max_age {
+            break;
+        }
+    }
+    newest
+}
+
 fn age(time: FileTime) -> Duration {
     let then = SystemTime::UNIX_EPOCH + Duration::from_secs(time.unix_seconds().max(0) as u64);
     SystemTime::now()
@@ -812,6 +1041,148 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&tmp);
         assert_eq!(result, (false, true, true, true, true, false, 1));
+    }
+
+    fn days_ago(days: i64) -> FileTime {
+        FileTime::from_unix_time(FileTime::now().unix_seconds() - days * 24 * 3600, 0)
+    }
+
+    #[test]
+    fn superseded_variants() {
+        let tmp =
+            std::env::temp_dir().join(format!("build-dir-gc-variants-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let unit = |name: &str, variant: Option<&str>| {
+            let dir = tmp.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            if let Some(v) = variant {
+                fs::write(dir.join(VARIANT_FILE), v).unwrap();
+            }
+            dir
+        };
+        // a: replaced by a newer build two days ago -> removed.
+        // b: the newest of variant 1 -> kept.
+        // c: replaced, but used within a day -> kept.
+        // d: the only unit of variant 2 -> kept.
+        // e: no variant recorded (built before) -> kept.
+        // f: replaced by g, which this build uses -> removed.
+        let units = vec![
+            (unit("a", Some("1")), days_ago(3)),
+            (unit("b", Some("1")), days_ago(2)),
+            (unit("c", Some("3")), FileTime::now()),
+            (unit("c2", Some("3")), FileTime::now()),
+            (unit("d", Some("2")), days_ago(5)),
+            (unit("e", None), days_ago(5)),
+            (unit("f", Some("4")), days_ago(2)),
+            (unit("g", Some("4")), days_ago(9)),
+        ];
+        let mut live = HashSet::default();
+        live.insert(tmp.join("g"));
+        let mut units = units;
+        let mut removed = Removed::default();
+        let day = Duration::from_secs(24 * 3600);
+        remove_superseded_variants(&mut units, &live, day, &mut removed).unwrap();
+        let mut left: Vec<_> = units
+            .iter()
+            .map(|(u, _)| u.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        left.sort();
+        let gone = (tmp.join("a").exists(), tmp.join("f").exists());
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(left, ["b", "c", "c2", "d", "e", "g"]);
+        assert_eq!(gone, (false, false));
+        assert_eq!(removed.count, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_outputs() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-orphans-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let profile = tmp.join("target/debug");
+        let unit = tmp.join("build-dir/unit");
+        fs::create_dir_all(profile.join("examples")).unwrap();
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(profile.join(".cargo-lock"), "").unwrap();
+        let output = |rel: &str, linked: bool, time: FileTime| {
+            let path = profile.join(rel);
+            fs::write(&path, "bin").unwrap();
+            fs::write(path.with_extension("d"), "").unwrap();
+            if linked {
+                fs::hard_link(&path, unit.join(rel.replace('/', "-"))).unwrap();
+            }
+            filetime::set_file_mtime(&path, time).unwrap();
+            path
+        };
+        let orphan = output("examples/old", false, days_ago(3));
+        let linked = output("app", true, days_ago(3));
+        let recent = output("fresh", false, FileTime::now());
+        let not_cargo = profile.join("notes.txt");
+        fs::write(&not_cargo, "mine").unwrap();
+        filetime::set_file_mtime(&not_cargo, days_ago(3)).unwrap();
+
+        let mut removed = Removed::default();
+        let day = Duration::from_secs(24 * 3600);
+        collect_orphan_outputs(&tmp.join("target"), day, &mut removed).unwrap();
+        let result = (
+            orphan.exists(),
+            orphan.with_extension("d").exists(),
+            linked.exists(),
+            recent.exists(),
+            not_cargo.exists(),
+            removed.count,
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(result, (false, false, true, true, true, 1));
+    }
+
+    #[test]
+    fn tmp_entries_age_out() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-tmp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("debug/build")).unwrap();
+        for (name, time) in [("old", days_ago(3)), ("touched", days_ago(3))] {
+            let dir = tmp.join("tmp").join(name).join("deep");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("file"), "").unwrap();
+            for p in [
+                dir.join("file"),
+                dir.clone(),
+                dir.parent().unwrap().to_path_buf(),
+            ] {
+                filetime::set_file_mtime(&p, time).unwrap();
+            }
+        }
+        // A test wrote deep inside it today, next to a stale test dir.
+        let stale = tmp.join("tmp/touched/stale");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("file"), "").unwrap();
+        filetime::set_file_mtime(stale.join("file"), days_ago(3)).unwrap();
+        filetime::set_file_mtime(&stale, days_ago(3)).unwrap();
+        filetime::set_file_mtime(tmp.join("tmp/touched/deep/file"), FileTime::now()).unwrap();
+
+        let mut removed = Removed::default();
+        let settings = GcSettings {
+            max_size: MaxSize::None,
+            ..GcSettings::default()
+        };
+        collect(
+            &tmp,
+            &HashSet::default(),
+            0,
+            FileTime::now(),
+            &settings,
+            None,
+            &mut removed,
+        )
+        .unwrap();
+        let result = (
+            tmp.join("tmp/old").exists(),
+            tmp.join("tmp/touched/deep/file").exists(),
+            stale.exists(),
+        );
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(result, (false, true, false));
     }
 
     #[test]

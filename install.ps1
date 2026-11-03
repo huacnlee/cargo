@@ -50,10 +50,13 @@ try {
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Release archive is missing cargo.exe.' }
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     if ((Test-Path -LiteralPath $target) -and -not (Test-Path -LiteralPath $backup)) {
-        Copy-Item -LiteralPath $target -Destination $backup
+    Copy-Item -LiteralPath $target -Destination $backup
     }
-    # Windows refuses replacement while cargo is running; report the failure.
-    Copy-Item -LiteralPath $binary -Destination $target -Force
+    # Rename into place like install.sh: a hard-linked rustup proxy record must
+    # not be overwritten in place, or every proxy name (rustup.exe, rustc.exe,
+    # rustdoc.exe, ...) becomes the fork binary.
+    Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+    Move-Item -LiteralPath $binary -Destination $target
     Write-Host "Installed $target"
     if (Test-Path -LiteralPath $backup) { Write-Host "Previous cargo kept as $backup (restore with -Uninstall)." }
     # Nightly builds use Cranelift for local crates; it ships as a component.

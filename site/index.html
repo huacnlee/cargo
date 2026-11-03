@@ -263,6 +263,7 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
     </div>
     <p class="sr-only" role="status" id="copy-status"></p>
     <p class="install-note">Installs over <code>~/.cargo/bin/cargo</code> and keeps the rustup proxy as <code>cargo.rustup</code>. <code>cargo +nightly</code> and <code>rust-toolchain.toml</code> keep working. Run the script with <code>--uninstall</code> to put the proxy back.</p>
+    <p class="install-note"><strong>Install once, stay current.</strong> At most once a day, after a command, cargo checks for a new release in the background and installs it: checksum verified, renamed into place, nothing printed. The last result is in <code>~/.cargo/.fork-update.log</code>. Set <code>CARGO_FORK_AUTO_UPDATE=0</code> to turn it off; it never runs in CI.</p>
   </div>
 
   <section id="measured">
@@ -307,6 +308,7 @@ footer p { border-top: 1px solid var(--color-border); padding-top: 16px; margin:
       <li><strong>Worktrees build at the same time.</strong> Fine-grained locking is on, so parallel agents do not queue on one lock. When two builds need the same dependency at once, one compiles it and the other reuses the result.</li>
       <li><strong>Less debug info in dev builds.</strong> Line tables for your crates, none for dependencies. Backtraces keep file and line. A <code>debug</code> setting in your profile still wins.</li>
       <li><strong>Metadata stored once on nightly.</strong> An rlib no longer carries a second copy of its <code>.rmeta</code> on a nightly rustc, about 30% off the shared dependencies.</li>
+      <li><strong>Updates itself.</strong> Once a day at most, a background check installs the latest release, so you never rerun the installer. <code>CARGO_FORK_AUTO_UPDATE=0</code> turns it off.</li>
       <li><strong>Cranelift on nightly.</strong> <code>cargo build</code> compiles your crates with Cranelift and runs the compiler front end on up to 8 threads. Tests and release builds keep LLVM. The installer adds the Cranelift component when you have a nightly toolchain.</li>
     </ul>
     <details>

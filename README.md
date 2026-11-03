@@ -23,6 +23,12 @@ This replaces `~/.cargo/bin/cargo` and keeps the rustup proxy as
 toolchain, the installer adds its Cranelift component. `rustup self update`
 reinstalls the proxy, so rerun the installer after it.
 
+It keeps itself up to date: at most once a day, after a command, cargo checks
+the latest release in the background and installs it the same way (checksum
+verified, renamed into place, so running builds are not disturbed). Nothing
+is printed; the last result is in `~/.cargo/.fork-update.log`. Set
+`CARGO_FORK_AUTO_UPDATE=0` to turn it off; it is also off in CI (`CI` set).
+
 Check which cargo is active:
 
 ```console

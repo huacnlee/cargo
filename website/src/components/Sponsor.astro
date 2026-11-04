@@ -1,0 +1,10 @@
+---
+import { copy, sponsorUrl, type Language } from '../lib/copy';
+
+interface Props { language: Language }
+const t = copy[Astro.props.language];
+---
+<aside class="sponsor">
+  <p>{t.sponsorText}</p>
+  <a class="sponsor-button" href={sponsorUrl} target="_blank" rel="noopener">{t.sponsorButton}</a>
+</aside>

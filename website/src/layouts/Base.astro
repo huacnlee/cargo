@@ -1,0 +1,182 @@
+---
+import '@fontsource-variable/geist';
+import '@fontsource-variable/jetbrains-mono';
+import '../styles/global.css';
+import { copy, sponsorUrl, type Language } from '../lib/copy';
+
+interface Props {
+  language: Language;
+  /** The page's path below the language root: '' or 'why/'. */
+  path: '' | 'why/';
+  title: string;
+  description: string;
+}
+const { language, path, title, description } = Astro.props;
+const t = copy[language];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const asset = (file: string) => `${base}/${file}`;
+const root = language === 'en' ? '' : 'zh-CN/';
+const absolute = (file: string) => new URL(asset(file), Astro.site);
+const projects = [
+  ['Disktree', 'https://huacnlee.github.io/disktree/'],
+  ['Omasend', 'https://huacnlee.github.io/omasend/'],
+  ['Omamail', 'https://huacnlee.github.io/omamail/'],
+  ['Noop', 'https://huacnlee.github.io/noop/'],
+  ['omarchy-mihoro', 'https://github.com/huacnlee/omarchy-mihoro'],
+  ['omarchy-which-key', 'https://github.com/huacnlee/omarchy-which-key'],
+];
+---
+<!doctype html>
+<html lang={language} data-theme="tokyo-night">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{title}</title>
+<meta name="description" content={description}>
+<link rel="canonical" href={absolute(root + path)}>
+<link rel="alternate" hreflang="en" href={absolute(path)}>
+<link rel="alternate" hreflang="zh-CN" href={absolute('zh-CN/' + path)}>
+<link rel="alternate" hreflang="x-default" href={absolute(path)}>
+<link rel="icon" href={asset('favicon.ico')} sizes="48x48 32x32">
+<meta property="og:title" content={title}>
+<meta property="og:description" content={description}>
+<meta property="og:type" content="website">
+<meta property="og:url" content={absolute(root + path)}>
+<meta property="og:image" content={absolute('disktree.webp')}>
+<script is:inline>
+  // Apply the saved or system theme before first paint.
+  (() => {
+    let theme = null;
+    try { theme = localStorage.getItem("theme"); } catch {}
+    if (!theme) theme = matchMedia("(prefers-color-scheme: light)").matches ? "flexoki-light" : "tokyo-night";
+    document.documentElement.dataset.theme = theme;
+  })();
+</script>
+</head>
+<body>
+<header class="bar">
+  <div class="bar-inner">
+    <a class="bar-name" href={asset(root)}><span>huacnlee/</span>cargo</a>
+    <nav class="bar-links" aria-label={t.nav.main}>
+      <a class="hide-sm" href={asset(root + 'why/')}>{t.nav.why}</a>
+      <a class="hide-sm" href="https://github.com/huacnlee/cargo">{t.nav.source}</a>
+      <a class="hide-sm" href="https://github.com/huacnlee/cargo/releases">{t.nav.releases}</a>
+      <a class="hide-sm sponsor-button" href={sponsorUrl} target="_blank" rel="noopener">{t.nav.sponsor}</a>
+    </nav>
+    <div class="language-control">
+      <button id="language-toggle" class="icon-control" type="button" aria-label={t.nav.language} title={t.nav.language} aria-haspopup="menu" aria-expanded="false" aria-controls="language-menu"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 5h12M9 2v3M5 5c1 6 5 10 10 12M13 5c-1 6-5 10-10 12M14 21l4-11 4 11M15.5 17h5"/></svg></button>
+      <div id="language-menu" role="menu" aria-label={t.nav.language} hidden>
+        <a role="menuitemradio" aria-checked={language === 'en' ? 'true' : 'false'} tabindex="-1" href={asset(path)} lang="en" hreflang="en">English</a>
+        <a role="menuitemradio" aria-checked={language === 'zh-CN' ? 'true' : 'false'} tabindex="-1" href={asset('zh-CN/' + path)} lang="zh-CN" hreflang="zh-CN">简体中文</a>
+      </div>
+    </div>
+    <label class="theme">
+      <select class="theme-select" id="theme" aria-label={t.nav.theme}>
+        <option value="tokyo-night">Tokyo Night</option>
+        <option value="catppuccin">Catppuccin</option>
+        <option value="flexoki-light">Flexoki Light</option>
+      </select>
+      <i class="icon" aria-hidden="true">{'\u{F0140}'}</i>
+    </label>
+  </div>
+</header>
+
+<main>
+  <slot />
+</main>
+
+<footer>
+  <p set:html={t.footer} />
+  <p class="more-projects">{t.moreProjects}: {projects.map(([name, href], i) => <>{i > 0 && ' · '}<a href={href}>{name}</a></>)}</p>
+</footer>
+
+<script>
+  // Theme: swap without animating every color.
+  const select = document.getElementById('theme') as HTMLSelectElement;
+  const root = document.documentElement;
+  select.value = root.dataset.theme ?? 'tokyo-night';
+  select.addEventListener('change', () => {
+    root.classList.add('no-transition');
+    root.dataset.theme = select.value;
+    try { localStorage.setItem('theme', select.value); } catch {}
+    requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove('no-transition')));
+  });
+
+  // Language menu.
+  const toggle = document.getElementById('language-toggle') as HTMLButtonElement;
+  const menu = document.getElementById('language-menu') as HTMLElement;
+  const languages = Array.from(menu.querySelectorAll<HTMLAnchorElement>('[role="menuitemradio"]'));
+  function closeLanguages(restore = false) {
+    menu.hidden = true;
+    toggle.setAttribute('aria-expanded', 'false');
+    if (restore) toggle.focus();
+  }
+  function openLanguages(last = false) {
+    menu.hidden = false;
+    toggle.setAttribute('aria-expanded', 'true');
+    languages[last ? languages.length - 1 : 0].focus();
+  }
+  toggle.addEventListener('click', () => (menu.hidden ? openLanguages() : closeLanguages()));
+  toggle.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      openLanguages(event.key === 'ArrowUp');
+    }
+  });
+  menu.addEventListener('keydown', event => {
+    if (event.key === 'Escape' || event.key === 'Tab') {
+      if (event.key === 'Escape') event.preventDefault();
+      closeLanguages(true);
+      return;
+    }
+    const index = languages.indexOf(document.activeElement as HTMLAnchorElement);
+    const next = event.key === 'ArrowDown' ? (index + 1) % languages.length
+      : event.key === 'ArrowUp' ? (index + languages.length - 1) % languages.length
+      : event.key === 'Home' ? 0 : event.key === 'End' ? languages.length - 1 : -1;
+    if (next >= 0) {
+      event.preventDefault();
+      languages[next].focus();
+    }
+  });
+  document.addEventListener('click', event => {
+    if (!(event.target as Element).closest('.language-control')) closeLanguages();
+  });
+
+  // Platform tabs with arrow-key navigation.
+  const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>('.tab'));
+  function selectTab(tab: HTMLButtonElement) {
+    for (const t of tabs) {
+      const on = t === tab;
+      t.setAttribute('aria-selected', String(on));
+      t.tabIndex = on ? 0 : -1;
+      document.getElementById(t.getAttribute('aria-controls') ?? '')!.hidden = !on;
+    }
+    tab.focus();
+  }
+  tabs.forEach((tab, i) => {
+    tab.addEventListener('click', () => selectTab(tab));
+    tab.addEventListener('keydown', event => {
+      if (event.key === 'ArrowRight') selectTab(tabs[(i + 1) % tabs.length]);
+      if (event.key === 'ArrowLeft') selectTab(tabs[(i - 1 + tabs.length) % tabs.length]);
+    });
+  });
+
+  // Copy buttons.
+  const status = document.getElementById('copy-status');
+  for (const btn of document.querySelectorAll<HTMLButtonElement>('.btn')) {
+    const icon = btn.querySelector('.icon')!;
+    btn.addEventListener('click', async () => {
+      const text = btn.parentElement!.querySelector('code')!.textContent ?? '';
+      let ok = true;
+      try { await navigator.clipboard.writeText(text); } catch { ok = false; }
+      icon.textContent = ok ? '\u{F012C}' : '\u{F0156}';
+      if (status) status.textContent = (ok ? btn.dataset.copied : btn.dataset.failed) ?? '';
+      setTimeout(() => {
+        icon.textContent = '\u{F018F}';
+        if (status) status.textContent = '';
+      }, 1600);
+    });
+  }
+</script>
+</body>
+</html>

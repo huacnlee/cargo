@@ -1,0 +1,171 @@
+---
+import Base from '../layouts/Base.astro';
+import Metrics from './Metrics.astro';
+import Sponsor from './Sponsor.astro';
+import { copy, metricRows, projectRows, worktrees, type Language } from '../lib/copy';
+
+interface Props { language: Language }
+const { language } = Astro.props;
+const t = copy[language];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const asset = (file: string) => `${base}/${file}`;
+const root = language === 'en' ? '' : 'zh-CN/';
+
+const { stock, fork } = worktrees;
+const n = stock.length;
+const fmtMin = (s: number) => `${(s / 60).toFixed(1)} ${t.minutes}`;
+const fmtGB = (g: number) => `${g.toFixed(1)} GB`;
+const elapsed = (rows: number[][], i: number) => rows.slice(0, i + 1).reduce((sum, row) => sum + row[0], 0);
+const disk = (rows: number[][], i: number) => rows[i][1];
+const stockTime = elapsed(stock, n - 1), forkTime = elapsed(fork, n - 1);
+const stockDisk = disk(stock, n - 1), forkDisk = disk(fork, n - 1);
+
+const mini = (rows: [string, string, number][], fmt: (v: number) => string) => {
+  const max = Math.max(...rows.map(r => r[2]));
+  return rows.map(([who, kind, v]) => ({ who, kind, pct: (v / max) * 70, label: fmt(v) }));
+};
+const growth = [
+  { title: t.totalDisk, value: disk, fmt: fmtGB, summary: `${fmtGB(stockDisk)} → ${fmtGB(forkDisk)}` },
+  { title: t.totalTime, value: elapsed, fmt: fmtMin, summary: `${fmtMin(stockTime)} → ${fmtMin(forkTime)}` },
+];
+const proof = [
+  { label: t.diskUsed, big: fmtGB(forkDisk), cmp: t.diskCmp(fmtGB(stockDisk), (stockDisk / forkDisk).toFixed(1)),
+    bars: mini([['Cargo', 'stock', stockDisk], ['Fork', 'fork', forkDisk]], fmtGB) },
+  { label: t.buildTime, big: fmtMin(forkTime), cmp: t.timeCmp(fmtMin(stockTime), (stockTime / forkTime).toFixed(1)),
+    bars: mini([['Cargo', 'stock', stockTime], ['Fork', 'fork', forkTime]], fmtMin) },
+];
+const installers = [
+  { id: 'unix', label: t.unix, prompt: '$ ', command: 'curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh' },
+  { id: 'windows', label: t.windows, prompt: '> ', command: 'irm https://huacnlee.github.io/cargo/install.ps1 | iex' },
+];
+const copyIcon = '\u{F018F}';
+---
+<Base language={language} path="" title="huacnlee/cargo" description={t.description}>
+  <div class="hero">
+    <p class="hero-label">{t.label}</p>
+    <h1 set:html={t.title} />
+    <p class="lead" set:html={t.lead} />
+
+    <div class="install">
+      <div class="tabs" role="tablist" aria-label={t.platform}>
+        {installers.map(({ id, label }, i) => (
+          <button class="tab" role="tab" id={`tab-${id}`} aria-controls={`cmd-${id}`} aria-selected={i === 0 ? 'true' : 'false'} tabindex={i === 0 ? 0 : -1}>{label}</button>
+        ))}
+      </div>
+      {installers.map(({ id, prompt, command }, i) => (
+        <div class="cmd" role="tabpanel" id={`cmd-${id}`} aria-labelledby={`tab-${id}`} hidden={i !== 0}>
+          <pre><span class="prompt">{prompt}</span><code>{command}</code></pre>
+          <button class="btn" type="button" aria-label={t.copyCommand} title={t.copyCommand} data-copied={t.copied} data-failed={t.copyFailed}><i class="icon" aria-hidden="true">{copyIcon}</i></button>
+        </div>
+      ))}
+    </div>
+    <p class="sr-only" role="status" id="copy-status"></p>
+    <p class="install-note" set:html={t.installNote} />
+    <p class="install-note" set:html={t.updateNote} />
+    <Sponsor language={language} />
+  </div>
+
+  <section id="why">
+    <h2>{t.whyTitle}</h2>
+    <p class="section-desc" set:html={t.whyShort(asset(root + 'why/'))} />
+  </section>
+
+  <section id="story">
+    <h2>{t.storyTitle}</h2>
+    <p class="section-desc" set:html={t.story} />
+    <figure class="shot">
+      <img src={asset('disktree.webp')} width="1600" height="1115" alt={t.shotAlt}>
+      <figcaption set:html={t.shotCaption} />
+    </figure>
+    <ul class="changes">
+      {t.storyPoints.map(point => <li set:html={point} />)}
+    </ul>
+    <p class="section-desc">{t.tradeoff}</p>
+    <p class="section-desc" set:html={t.postsLink(asset(root + 'why/#posts'))} />
+  </section>
+
+  <section id="measured">
+    <h2>{t.measuredTitle}</h2>
+    <div class="proof">
+      <p class="proof-title">{t.proofTitle(n)}</p>
+      <div class="proof-grid">
+        {proof.map(({ label, big, cmp, bars }) => (
+          <div>
+            <p class="stat-label">{label}</p>
+            <p class="stat-big"><strong>{big}</strong><span>{cmp}</span></p>
+            <div class="mini">
+              {bars.map(({ who, kind, pct, label: value }) => (
+                <>
+                  <span>{who}</span>
+                  <div class="track"><div class={`fill ${kind}`} style={`width:${pct}%`} /><span class="val" style={`left:${pct}%`}>{value}</span></div>
+                </>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+    <p class="section-desc">{t.setup}</p>
+    <ul class="legend">
+      <li><span class="swatch stock"></span>Cargo</li>
+      <li><span class="swatch fork"></span>{t.thisFork}</li>
+    </ul>
+    <div class="growth">
+      {growth.map(({ title, value, fmt, summary }) => {
+        const max = value(stock, n - 1);
+        return (
+          <div>
+            <h3>{title} <span class="h3-val">{summary}</span></h3>
+            <div class="cols" style={`--n:${n}`}>
+              {stock.map((_, i) => (
+                <div class="col">
+                  <div class="b stock" style={`height:${(value(stock, i) / max) * 100}%`} title={fmt(value(stock, i))} />
+                  <div class="b fork" style={`height:${(value(fork, i) / max) * 100}%`} title={fmt(value(fork, i))} />
+                </div>
+              ))}
+            </div>
+            <div class="axis" style={`--n:${n}`}>{stock.map((_, i) => <span>{i + 1}</span>)}</div>
+          </div>
+        );
+      })}
+    </div>
+    <p class="section-desc" style="margin-top:24px" set:html={t.measuredNote} />
+    <Metrics language={language} text={t.metrics} numbers={metricRows} />
+  </section>
+
+  <section id="projects">
+    <h2>{t.projectsTitle}</h2>
+    <p class="section-desc">{t.projectsSetup}</p>
+    <Metrics language={language} text={t.projects} numbers={projectRows} />
+  </section>
+
+  <section id="cleanup">
+    <h2>{t.cleanupTitle}</h2>
+    <p class="section-desc">{t.cleanup}</p>
+<pre class="term"><span class="prompt">$ </span><span class="cmdline">cargo build</span>
+    <span class="status">Finished</span> `dev` profile [unoptimized + debuginfo] target(s) in 1.89s
+     <span class="status">Cleaned</span> 680 stale build units, 10.1GiB freed (build.gc)</pre>
+  </section>
+
+  <section id="changes">
+    <h2>{t.changesTitle}</h2>
+    <p class="section-desc" set:html={t.changesIntro} />
+    <ul class="changes">
+      {t.changes.map(change => <li set:html={change} />)}
+    </ul>
+    <details>
+      <summary>{t.changeDefault}</summary>
+<pre class="term"><span class="prompt"># ~/.cargo/config.toml</span>
+<span class="cmdline">[build.gc]</span>
+max-size = "auto"      <span class="prompt"># or "15 GiB", "none"</span>
+shared-max-size = "50 GiB"
+max-unused = "1 day"
+shared-max-unused = "7 days"
+frequency = "1 hour"   <span class="prompt"># or "always", "never"</span>
+enabled = true</pre>
+      <p set:html={t.envVars} />
+    </details>
+  </section>
+
+  <Sponsor language={language} />
+</Base>

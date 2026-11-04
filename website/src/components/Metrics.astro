@@ -1,0 +1,34 @@
+---
+import { copy, type Language, type Series } from '../lib/copy';
+
+interface Props {
+  language: Language;
+  text: readonly { title: string; note: string }[];
+  numbers: { unit: string; rows: [Series, number][] }[];
+}
+const { language, text, numbers } = Astro.props;
+const t = copy[language];
+---
+<div class="metrics">
+  {numbers.map(({ unit, rows }, i) => {
+    const max = Math.max(...rows.map(([, value]) => value));
+    return (
+      <div class="metric">
+        <h3>{text[i].title}</h3>
+        <p class="note">{text[i].note}</p>
+        {rows.map(([series, value]) => {
+          const pct = (value / max) * 78;
+          return (
+            <div class="row">
+              <span class="who">{t.series[series]}</span>
+              <div class="track">
+                <div class={`fill ${series}`} style={`width:${pct}%`} />
+                <span class="val" style={`left:${pct}%`}>{value}{unit}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  })}
+</div>

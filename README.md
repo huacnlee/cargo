@@ -1,9 +1,38 @@
 # huacnlee/cargo
 
-A drop-in Cargo fork: every git worktree of a project shares one build
-directory, which stays under a size limit on its own. Nothing to configure.
+**Stop deleting `target`.**
+
+A drop-in Cargo fork for machines full of git worktrees and AI agents. They
+share one build directory that stays under a size limit on its own, so you
+never clean it and never rebuild from scratch. Install it and you are done:
+there is nothing to configure.
 
 https://huacnlee.github.io/cargo/
+
+![Disktree treemap of a home directory: ~/.cargo/targets is 41.7 GB of 99.5 GB, with 711.9 GB of the disk free.](website/public/disktree.webp)
+
+Five days straight on my Linux and macOS computers, with no `target` cleaned and
+no full disk. All Rust build output on this machine is 41.7 GB.
+
+Why and how I built it: [the background](https://huacnlee.github.io/cargo/why/) and
+[my posts on X](https://huacnlee.github.io/cargo/why/#posts).
+
+**If this helps you, please [sponsor me](https://github.com/sponsors/huacnlee).**
+
+## 中文介绍
+
+**不用再删 `target` 了。**
+
+这是一个可以直接替换官方 Cargo 的分支，为同时跑大量 git worktree 和 AI Agent 的电脑而做。
+所有 worktree 共用一个构建目录，它会自己控制在大小限制之内，所以不用清理，也不会再从头编译。
+只需要安装，不需要任何配置。
+
+在我的 Linux 和 macOS 电脑上已经连续用了 5 天，没有清理过 `target`，磁盘也没有再占满。上面
+截图这台电脑的全部 Rust 构建产物一共 41.7 GB。
+
+为什么做、怎么做的，见[项目背景](https://huacnlee.github.io/cargo/zh-CN/why/)和[我在 X 上的记录](https://huacnlee.github.io/cargo/zh-CN/why/#posts)。
+
+**如果这个项目帮到了你，请[赞助我](https://github.com/sponsors/huacnlee)。**
 
 ## Install
 

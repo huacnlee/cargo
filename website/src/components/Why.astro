@@ -1,0 +1,34 @@
+---
+import Base from '../layouts/Base.astro';
+import Sponsor from './Sponsor.astro';
+import { copy, posts, type Language } from '../lib/copy';
+
+interface Props { language: Language }
+const { language } = Astro.props;
+const t = copy[language];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const asset = (file: string) => `${base}/${file}`;
+const root = language === 'en' ? '' : 'zh-CN/';
+// An X post's ID holds its time: milliseconds since X's epoch, above the low 22 bits.
+const postTime = (id: string) => new Date(Number((BigInt(id) >> 22n) + 1288834974657n));
+const formatDate = new Intl.DateTimeFormat(language, { timeZone: 'Asia/Shanghai', month: 'short', day: 'numeric' });
+---
+<Base language={language} path="why/" title={`${t.whyTitle} · huacnlee/cargo`} description={t.why.description}>
+  <article class="prose">
+    <h1>{t.whyTitle}</h1>
+    {t.why.before.map(paragraph => <p set:html={paragraph} />)}
+    <figure class="shot">
+      <img src={asset('disktree.webp')} width="1600" height="1115" alt={t.shotAlt}>
+      <figcaption set:html={t.why.shotCaption} />
+    </figure>
+    {t.why.after.map(paragraph => <p set:html={paragraph} />)}
+    <p set:html={t.why.more(asset(root))} />
+    <Sponsor language={language} />
+    <h2 id="posts">{t.why.postsTitle}</h2>
+    <ul class="posts">
+      {posts.map(post => (
+        <li><a href={`https://x.com/huacnlee/status/${post.id}`}><time>{formatDate.format(postTime(post.id))}</time><span set:html={post[language]} /></a></li>
+      ))}
+    </ul>
+  </article>
+</Base>

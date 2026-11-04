@@ -67,3 +67,19 @@ grep -qE 'up to date|updated' "$log"
 
 # Still runs afterwards.
 run "$cargo" -V
+
+# A `rustup` that is really this cargo, as older install.ps1 left behind, must
+# not make it ask itself for the toolchain forever.
+cp "$bin" "$home/bin/rustup$exe"
+run CARGO_FORK_AUTO_UPDATE=0 PATH="$home/bin:$PATH" "$cargo" -V >"$home/out" &
+pid=$!
+for _ in $(seq 10); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+if kill -0 $pid 2>/dev/null; then
+    echo "cargo -V keeps starting itself when rustup is cargo" >&2
+    for _ in 1 2 3 4 5; do
+        pkill -f "$home/bin/rustup" || taskkill //F //IM "rustup$exe" || true
+    done >/dev/null 2>&1
+    exit 1
+fi
+wait $pid
+echo "cargo -V with cargo as rustup: $(cat "$home/out")"

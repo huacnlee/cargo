@@ -12,6 +12,10 @@ $ProgressPreference = 'SilentlyContinue'
 if ($env:OS -ne 'Windows_NT') { throw 'This installer requires Windows. Use install.sh on macOS or Linux.' }
 $target = Join-Path $InstallDir 'cargo.exe'
 $backup = Join-Path $InstallDir 'cargo.rustup.exe'
+# Reads the file instead of running it: older builds recurse when run as rustup.
+function Test-ForkCargo([string]$Path) {
+    [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path)).Contains('huacnlee/cargo')
+}
 if ($Uninstall) {
     if (-not (Test-Path -LiteralPath $backup)) { throw "Nothing to restore: $backup does not exist." }
     Move-Item -LiteralPath $backup -Destination $target -Force
@@ -49,15 +53,37 @@ try {
     $binary = Join-Path $unpacked 'cargo.exe'
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Release archive is missing cargo.exe.' }
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    if ((Test-Path -LiteralPath $target) -and -not (Test-Path -LiteralPath $backup)) {
+    # Earlier versions of this script overwrote rustup.exe with this cargo (see
+    # below), which breaks rustup and every proxy. Put the real one back.
+    $rustup = Join-Path $InstallDir 'rustup.exe'
+    if ((Test-Path -LiteralPath $rustup) -and (Test-ForkCargo $rustup)) {
+        $real = @($backup, $target) | Where-Object { (Test-Path -LiteralPath $_) -and -not (Test-ForkCargo $_) } | Select-Object -First 1
+        if ($real) {
+            Copy-Item -LiteralPath $real -Destination "$rustup.staged"
+            Move-Item -LiteralPath "$rustup.staged" -Destination $rustup -Force
+            Write-Host "Restored $rustup from $real"
+        } else {
+            Write-Warning "$rustup is a copy of this cargo and no original is left; reinstall rustup from https://rustup.rs."
+        }
+    }
+    if ((Test-Path -LiteralPath $target) -and -not (Test-Path -LiteralPath $backup) -and -not (Test-ForkCargo $target)) {
         Copy-Item -LiteralPath $target -Destination $backup
     }
+    # cargo.exe is usually a link to rustup.exe, and copying onto it would write
+    # through the link and overwrite rustup.exe, so stage the file and move it.
     # Windows refuses replacement while cargo is running; report the failure.
-    Copy-Item -LiteralPath $binary -Destination $target -Force
+    $staged = Join-Path $InstallDir ".cargo-staged-$PID.exe"
+    Copy-Item -LiteralPath $binary -Destination $staged
+    try {
+        Move-Item -LiteralPath $staged -Destination $target -Force
+    } finally {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "Installed $target"
     if (Test-Path -LiteralPath $backup) { Write-Host "Previous cargo kept as $backup (restore with -Uninstall)." }
     # Nightly builds use Cranelift for local crates; it ships as a component.
-    if ((Get-Command rustup -ErrorAction SilentlyContinue) -and (rustup toolchain list | Select-String '^nightly')) {
+    $rustupCommand = Get-Command rustup -ErrorAction SilentlyContinue
+    if ($rustupCommand -and -not (Test-ForkCargo $rustupCommand.Source) -and (rustup toolchain list | Select-String '^nightly')) {
         Write-Host 'Adding the Cranelift backend to the nightly toolchain…'
         rustup component add rustc-codegen-cranelift-preview --toolchain nightly *> $null
         if ($LASTEXITCODE -ne 0) { Write-Host 'Cranelift is not available for this nightly; nightly builds use LLVM.' }

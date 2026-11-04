@@ -475,11 +475,19 @@ fn pin_rustup_toolchain() {
             }
         }
     }
-    if std::env::var_os("RUSTUP_TOOLCHAIN").is_some() || std::env::var_os("RUSTC").is_some() {
+    // Set on the `rustup` asked below. If that `rustup` is really this cargo
+    // (older install.ps1 overwrote rustup.exe through the cargo.exe link), it
+    // would ask `rustup` again, starting processes without end.
+    const PIN_GUARD: &str = "__CARGO_FORK_PINNING_TOOLCHAIN";
+    if std::env::var_os("RUSTUP_TOOLCHAIN").is_some()
+        || std::env::var_os("RUSTC").is_some()
+        || std::env::var_os(PIN_GUARD).is_some()
+    {
         return;
     }
     let Ok(out) = std::process::Command::new("rustup")
         .args(["show", "active-toolchain"])
+        .env(PIN_GUARD, "1")
         .stderr(std::process::Stdio::null())
         .output()
     else {

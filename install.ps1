@@ -54,7 +54,7 @@ $base = "https://github.com/huacnlee/cargo/releases/download/v$Version"
 $work = Join-Path ([IO.Path]::GetTempPath()) ('cargo-install-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
-    Write-Host "Downloading cargo $Version for $triple…"
+    Write-Host "Downloading cargo $Version for $triple..."
     $archive = Join-Path $work $asset
     Invoke-WebRequest -UseBasicParsing -Uri "$base/$asset" -OutFile $archive
     $checksums = Join-Path $work 'SHA256SUMS'
@@ -90,9 +90,12 @@ try {
     Write-Host "Installed $target"
     if (Test-Path -LiteralPath $backup) { Write-Host "Previous cargo kept as $backup (restore with -Uninstall)." }
     # Nightly builds use Cranelift for local crates; it ships as a component.
+    # rustup logs to stderr, which Windows PowerShell turns into errors. Under
+    # `Stop` the first log line would abort the script.
+    $ErrorActionPreference = 'Continue'
     $rustupCommand = Get-Command rustup -ErrorAction SilentlyContinue
     if ($rustupCommand -and -not (Test-ForkCargo $rustupCommand.Source) -and (rustup toolchain list | Select-String '^nightly')) {
-        Write-Host 'Adding the Cranelift backend to the nightly toolchain…'
+        Write-Host 'Adding the Cranelift backend to the nightly toolchain...'
         rustup component add rustc-codegen-cranelift-preview --toolchain nightly *> $null
         if ($LASTEXITCODE -ne 0) { Write-Host 'Cranelift is not available for this nightly; nightly builds use LLVM.' }
     }

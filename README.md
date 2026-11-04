@@ -18,10 +18,22 @@ irm https://huacnlee.github.io/cargo/install.ps1 | iex
 ```
 
 This replaces `~/.cargo/bin/cargo` and keeps the rustup proxy as
-`cargo.rustup`; run the script with `--uninstall` to put it back.
+`cargo.rustup`.
 `cargo +nightly` and `rust-toolchain.toml` keep working. If you have a nightly
 toolchain, the installer adds its Cranelift component. `rustup self update`
 reinstalls the proxy, so rerun the installer after it.
+
+To uninstall and put the rustup proxy back:
+
+```sh
+curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh -s -- --uninstall
+```
+
+Windows (PowerShell):
+
+```powershell
+& ([scriptblock]::Create((irm https://huacnlee.github.io/cargo/install.ps1))) -Uninstall
+```
 
 It keeps itself up to date: at most once a day, after a command, cargo checks
 the latest release in the background and installs it the same way (checksum

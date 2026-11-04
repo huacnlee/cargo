@@ -27,9 +27,11 @@ done
 die() { printf 'cargo installer: %s\n' "$*" >&2; exit 1; }
 target="$destination/cargo"
 backup="$destination/cargo.rustup"
+is_fork() { grep -aq 'huacnlee/cargo' "$1"; }
 
 if [ -n "$uninstall" ]; then
   [ -e "$backup" ] || die "Nothing to restore: $backup does not exist."
+  if is_fork "$backup"; then die "$backup is huacnlee/cargo, not the original; reinstall rustup from https://rustup.rs."; fi
   mv -f "$backup" "$target"
   printf 'Restored %s\n' "$target"
   exit 0
@@ -82,7 +84,9 @@ tar -xzf "$work/$asset" -C "$work/unpacked"
 
 mkdir -p "$destination"
 # Keep the rustup proxy (or whatever cargo was there) the first time only.
-if [ -e "$target" ] && [ ! -e "$backup" ]; then cp -p "$target" "$backup"; fi
+# The backup must be what this cargo replaced, never a build of this cargo.
+if [ -e "$backup" ] && is_fork "$backup"; then rm -f "$backup"; fi
+if [ -e "$target" ] && [ ! -e "$backup" ] && ! is_fork "$target"; then cp -p "$target" "$backup"; fi
 # Rename into place so running cargo processes keep their old inode.
 staged="$(mktemp "$destination/.cargo.XXXXXXXX")"
 trap 'rm -rf "$work"; rm -f "${staged:-}"' 0

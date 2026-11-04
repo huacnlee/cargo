@@ -16,8 +16,24 @@ $backup = Join-Path $InstallDir 'cargo.rustup.exe'
 function Test-ForkCargo([string]$Path) {
     [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path)).Contains('huacnlee/cargo')
 }
+# Earlier versions of this script overwrote rustup.exe with this cargo, which
+# breaks rustup and every proxy. Puts the real one back.
+function Restore-Rustup {
+    $rustup = Join-Path $InstallDir 'rustup.exe'
+    if (-not (Test-Path -LiteralPath $rustup) -or -not (Test-ForkCargo $rustup)) { return }
+    $real = @($backup, $target) | Where-Object { (Test-Path -LiteralPath $_) -and -not (Test-ForkCargo $_) } | Select-Object -First 1
+    if ($real) {
+        Copy-Item -LiteralPath $real -Destination "$rustup.staged"
+        Move-Item -LiteralPath "$rustup.staged" -Destination $rustup -Force
+        Write-Host "Restored $rustup from $real"
+    } else {
+        Write-Warning "$rustup is a copy of this cargo and no original is left; reinstall rustup from https://rustup.rs."
+    }
+}
 if ($Uninstall) {
     if (-not (Test-Path -LiteralPath $backup)) { throw "Nothing to restore: $backup does not exist." }
+    if (Test-ForkCargo $backup) { throw "$backup is huacnlee/cargo, not the original; reinstall rustup from https://rustup.rs." }
+    Restore-Rustup
     Move-Item -LiteralPath $backup -Destination $target -Force
     Write-Host "Restored $target"
     return
@@ -53,18 +69,10 @@ try {
     $binary = Join-Path $unpacked 'cargo.exe'
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) { throw 'Release archive is missing cargo.exe.' }
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    # Earlier versions of this script overwrote rustup.exe with this cargo (see
-    # below), which breaks rustup and every proxy. Put the real one back.
-    $rustup = Join-Path $InstallDir 'rustup.exe'
-    if ((Test-Path -LiteralPath $rustup) -and (Test-ForkCargo $rustup)) {
-        $real = @($backup, $target) | Where-Object { (Test-Path -LiteralPath $_) -and -not (Test-ForkCargo $_) } | Select-Object -First 1
-        if ($real) {
-            Copy-Item -LiteralPath $real -Destination "$rustup.staged"
-            Move-Item -LiteralPath "$rustup.staged" -Destination $rustup -Force
-            Write-Host "Restored $rustup from $real"
-        } else {
-            Write-Warning "$rustup is a copy of this cargo and no original is left; reinstall rustup from https://rustup.rs."
-        }
+    Restore-Rustup
+    # The backup must be what this cargo replaced, never a build of this cargo.
+    if ((Test-Path -LiteralPath $backup) -and (Test-ForkCargo $backup)) {
+        Remove-Item -LiteralPath $backup -Force
     }
     if ((Test-Path -LiteralPath $target) -and -not (Test-Path -LiteralPath $backup) -and -not (Test-ForkCargo $target)) {
         Copy-Item -LiteralPath $target -Destination $backup

@@ -10,21 +10,26 @@ use crate::{
 use crate::util::data_structures::HashMap;
 use anyhow::bail;
 use std::{
+    collections::hash_map::Entry,
     fmt::{Display, Formatter},
     path::PathBuf,
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 use tracing::instrument;
+
+pub(super) const GC_LOCK_FILE: &str = ".cargo-gc-lock";
 
 /// A struct to store the lock handles for build units during compilation.
 pub struct LockManager {
     locks: RwLock<HashMap<LockKey, FileLock>>,
+    gc_locks: Mutex<HashMap<PathBuf, FileLock>>,
 }
 
 impl LockManager {
     pub fn new() -> Self {
         Self {
             locks: RwLock::new(HashMap::default()),
+            gc_locks: Mutex::new(HashMap::default()),
         }
     }
 
@@ -43,6 +48,24 @@ impl LockManager {
         let key = LockKey::from_unit(build_runner, unit);
         tracing::Span::current().record("key", key.0.to_str());
 
+        if build_runner.bcx.gctx.cli_unstable().build_dir_new_layout
+            && !crate::workspace::features::is_fork_defaults_opt_out()
+        {
+            // Dirty units release their write lock while queued. Keep GC away
+            // until all jobs finish, using a lock outside the removable unit.
+            let pkg_dir = key.0.parent().unwrap().parent().unwrap().to_path_buf();
+            let mut gc_locks = self.gc_locks.lock().unwrap();
+            if let Entry::Vacant(entry) = gc_locks.entry(pkg_dir) {
+                let fs = Filesystem::new(entry.key().clone());
+                let lock = fs.open_ro_shared_create(
+                    GC_LOCK_FILE,
+                    build_runner.bcx.gctx,
+                    "package build directory",
+                )?;
+                entry.insert(lock);
+            }
+        }
+
         let mut locks = self.locks.write().unwrap();
         if let Some(lock) = locks.get_mut(&key) {
             flock::lock_shared(lock.file())?;
@@ -58,6 +81,10 @@ impl LockManager {
         }
 
         Ok(key)
+    }
+
+    pub fn release_gc_locks(&self) {
+        self.gc_locks.lock().unwrap().clear();
     }
 
     #[instrument(skip(self))]

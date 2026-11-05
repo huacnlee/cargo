@@ -69,6 +69,7 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
+use crate::compiler::locking::GC_LOCK_FILE;
 use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
 use crate::util::data_structures::HashSet;
 use crate::util::flock;
@@ -196,6 +197,7 @@ pub fn run(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) {
 }
 
 fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> CargoResult<()> {
+    build_runner.lock_manager.release_gc_locks();
     let gctx = build_runner.bcx.gctx;
     // The old layout mixes the files of all units in shared directories.
     if !gctx.cli_unstable().build_dir_new_layout || features::is_fork_defaults_opt_out() {
@@ -818,6 +820,25 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 /// Cargo holds the lock of, and incremental dirs whose session a running
 /// rustc has locked (`s-*.lock`).
 fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
+    // The unit's own lock is released while a dirty job is queued, and is
+    // deleted with the unit. This stable package lock also covers that gap.
+    let _gc_lock = if let Some(pkg) = path.parent()
+        && pkg.parent().and_then(Path::file_name) == Some("build".as_ref())
+    {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(pkg.join(GC_LOCK_FILE))?;
+        match flock::try_lock_exclusive(&file) {
+            Ok(()) => Some(file),
+            Err(fs::TryLockError::WouldBlock) => return Ok(0),
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    } else {
+        None
+    };
     let mut lock_files = vec![path.join(".lock")];
     if let Ok(entries) = fs::read_dir(path) {
         lock_files.extend(

@@ -822,9 +822,13 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     // The unit's own lock is released while a dirty job is queued, and is
     // deleted with the unit. This stable package lock also covers that gap.
-    let _gc_lock = if let Some(pkg) = path.parent()
-        && pkg.parent().and_then(Path::file_name) == Some("build".as_ref())
-    {
+    let pkg = path
+        .parent()
+        .filter(|pkg| pkg.parent().and_then(Path::file_name) == Some("build".as_ref()));
+    let is_package =
+        pkg.is_none() && path.parent().and_then(Path::file_name) == Some("build".as_ref());
+    let pkg = pkg.or_else(|| is_package.then_some(path));
+    let _gc_lock = if let Some(pkg) = pkg {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -839,6 +843,10 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     } else {
         None
     };
+    // A builder may have added new-layout units since collection began.
+    if is_package && !is_legacy_unit_dir(path) {
+        return Ok(0);
+    }
     let mut lock_files = vec![path.join(".lock")];
     if let Ok(entries) = fs::read_dir(path) {
         lock_files.extend(
@@ -865,7 +873,21 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     }
     let size = cargo_util::du(path, &[]).unwrap_or(0);
     debug!("build.gc removing {}", path.display());
-    paths::remove_dir_all(path)?;
+    if is_package {
+        // Keep the package lock's inode stable for builders waiting on it.
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_name() != GC_LOCK_FILE {
+                if entry.file_type()?.is_dir() {
+                    paths::remove_dir_all(&entry.path())?;
+                } else {
+                    paths::remove_file(&entry.path())?;
+                }
+            }
+        }
+    } else {
+        paths::remove_dir_all(path)?;
+    }
     removed.count += 1;
     removed.bytes += size;
     Ok(size)
@@ -898,7 +920,19 @@ fn is_legacy_unit_dir(dir: &Path) -> bool {
         return false;
     };
     match name.rsplit_once('-') {
-        Some((_, hash)) => hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        Some((_, hash)) => {
+            hash.len() == 16
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && !fs::read_dir(dir).is_ok_and(|entries| {
+                    entries.flatten().any(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.len() == 16
+                            && name.bytes().all(|b| b.is_ascii_hexdigit())
+                            && entry.path().is_dir()
+                    })
+                })
+        }
         None => false,
     }
 }
@@ -981,6 +1015,58 @@ mod tests {
         assert!(!is_legacy_unit_dir(Path::new("build/nsh-core")));
         assert!(!is_legacy_unit_dir(Path::new("build/serde")));
         assert!(!is_legacy_unit_dir(Path::new("build/foo-0123")));
+    }
+
+    #[test]
+    fn gc_preserves_packages_with_legacy_names() {
+        for name in ["hold-0123456789abcdef", "build"] {
+            let tmp =
+                std::env::temp_dir().join(format!("build-dir-gc-name-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&tmp);
+            let pkg = tmp.join("debug/build").join(name);
+            let unit = pkg.join("fedcba9876543210");
+            fs::create_dir_all(unit.join("fingerprint")).unwrap();
+            fs::write(unit.join("fingerprint/invoked.timestamp"), "queued").unwrap();
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(pkg.join(GC_LOCK_FILE))
+                .unwrap();
+            flock::lock_shared(&lock).unwrap();
+            let settings = GcSettings {
+                max_unused: Duration::ZERO,
+                max_size: MaxSize::Bytes(0),
+                ..GcSettings::default()
+            };
+            let mut removed = Removed::default();
+            let collect = |live: &HashSet<PathBuf>, removed: &mut Removed| {
+                collect(&tmp, live, 0, FileTime::now(), &settings, None, removed).unwrap();
+            };
+            collect(&HashSet::default(), &mut removed);
+            assert!(unit.join("fingerprint/invoked.timestamp").is_file());
+            // Even a package-level candidate must respect the guard.
+            remove(&pkg, &mut removed).unwrap();
+            assert!(unit.is_dir());
+            drop(lock);
+            remove(&pkg, &mut removed).unwrap();
+            assert!(unit.is_dir());
+            collect(&HashSet::from_iter([unit.clone()]), &mut removed);
+            assert!(unit.is_dir());
+            collect(&HashSet::default(), &mut removed);
+            assert!(!unit.exists());
+            assert!(pkg.join(GC_LOCK_FILE).is_file());
+
+            let legacy = tmp.join("debug/build/old-0123456789abcdef");
+            fs::create_dir_all(legacy.join("out")).unwrap();
+            fs::write(legacy.join("output"), "old").unwrap();
+            collect(&HashSet::default(), &mut removed);
+            assert!(!legacy.join("out").exists());
+            assert!(!legacy.join("output").exists());
+            assert!(legacy.join(GC_LOCK_FILE).is_file());
+            fs::remove_dir_all(tmp).unwrap();
+        }
     }
 
     #[test]

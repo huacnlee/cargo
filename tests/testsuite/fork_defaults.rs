@@ -179,7 +179,57 @@ fn repo_with_worktree(main: &str) -> (Project, PathBuf) {
 
 #[cargo_test]
 fn gc_preserves_queued_units_in_another_worktree() {
-    use std::process::Stdio;
+    use std::process::{Child, Command, Output, Stdio};
+
+    struct Build {
+        child: Option<Child>,
+        stdout: PathBuf,
+        stderr: PathBuf,
+    }
+
+    impl Build {
+        fn spawn(mut command: Command, name: &str) -> Self {
+            let stdout = paths::root().join(format!("{name}.stdout"));
+            let stderr = paths::root().join(format!("{name}.stderr"));
+            command
+                .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+                .stderr(Stdio::from(fs::File::create(&stderr).unwrap()));
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            Self {
+                child: Some(command.spawn().unwrap()),
+                stdout,
+                stderr,
+            }
+        }
+
+        fn wait(mut self) -> Output {
+            let status =
+                cargo_test_support::retry(600, || self.child.as_mut().unwrap().try_wait().unwrap());
+            self.child.take();
+            Output {
+                status,
+                stdout: fs::read(&self.stdout).unwrap(),
+                stderr: fs::read(&self.stderr).unwrap(),
+            }
+        }
+    }
+
+    impl Drop for Build {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 
     let (p, wt) = repo_with_worktree("fn main() { println!(\"{}\", bar::bar()); }");
     let script = r#"
@@ -201,16 +251,15 @@ fn gc_preserves_queued_units_in_another_worktree() {
     let barrier = paths::root().join("barrier");
     fs::create_dir(&barrier).unwrap();
 
-    let mut first = fork_cargo(&p, "build -j1")
-        .env("BARRIER_DIR", &barrier)
-        .build_command()
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut first = Build::spawn(
+        fork_cargo(&p, "build -j1")
+            .env("BARRIER_DIR", &barrier)
+            .build_command(),
+        "first",
+    );
     cargo_test_support::retry(600, || {
         assert!(
-            first.try_wait().unwrap().is_none(),
+            first.child.as_mut().unwrap().try_wait().unwrap().is_none(),
             "build exited before barrier"
         );
         barrier.join("ready").exists().then_some(())
@@ -218,21 +267,18 @@ fn gc_preserves_queued_units_in_another_worktree() {
 
     // All units are prepared, but foo's dirty job has released its unit lock
     // while it waits for bar's build script. Collect from the other worktree.
-    let second = fork_cargo(&p, "build -p bar")
-        .cwd(&wt)
-        .env("CARGO_BUILD_GC_FREQUENCY", "always")
-        .env("CARGO_BUILD_GC_MAX_UNUSED", "0 seconds")
-        .env("CARGO_BUILD_GC_MAX_SIZE", "0")
-        .build_command()
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let second =
-        cargo_test_support::threaded_timeout(600, move || second.wait_with_output().unwrap());
+    let second = Build::spawn(
+        fork_cargo(&p, "build -p bar")
+            .cwd(&wt)
+            .env("CARGO_BUILD_GC_FREQUENCY", "always")
+            .env("CARGO_BUILD_GC_MAX_UNUSED", "0 seconds")
+            .env("CARGO_BUILD_GC_MAX_SIZE", "0")
+            .build_command(),
+        "second",
+    );
+    let second = second.wait();
     fs::write(barrier.join("release"), "").unwrap();
-    let first =
-        cargo_test_support::threaded_timeout(600, move || first.wait_with_output().unwrap());
+    let first = first.wait();
     cargo_test_support::execs().run_output(&second);
     cargo_test_support::execs().run_output(&first);
     assert!(p.bin("foo").is_file());

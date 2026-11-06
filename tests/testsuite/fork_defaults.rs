@@ -7,7 +7,9 @@ use std::path::PathBuf;
 
 use crate::prelude::*;
 use cargo_test_support::registry::Package;
-use cargo_test_support::{Execs, Project, basic_lib_manifest, git, paths, project, str};
+use cargo_test_support::{
+    Execs, Project, basic_lib_manifest, basic_manifest, git, paths, project, str,
+};
 
 fn fork_cargo(p: &Project, args: &str) -> Execs {
     let mut execs = p.cargo(args);
@@ -145,6 +147,78 @@ fn check_and_build_share_registry_dependencies() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
+        .run();
+}
+
+#[cargo_test]
+fn registry_dependencies_of_a_patched_crate_are_checked() {
+    Package::new("bar", "1.0.0")
+        .file("src/lib.rs", "pub struct Bar;")
+        .publish();
+    Package::new("baz", "1.0.0")
+        .dep("bar", "1.0")
+        .file("src/lib.rs", "pub fn bar() -> bar::Bar { bar::Bar }")
+        .publish();
+    Package::new("qux", "1.0.0")
+        .file("src/lib.rs", "pub fn qux() {}")
+        .publish();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+            edition = "2015"
+
+            [dependencies]
+            bar = "1.0"
+            baz = "1.0"
+            qux = "1.0"
+
+            [patch.crates-io]
+            bar = { path = "bar" }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn bar() -> bar::Bar { qux::qux(); baz::bar() }",
+        )
+        .file("bar/Cargo.toml", &basic_manifest("bar", "1.0.0"))
+        .file("bar/src/lib.rs", "pub struct Bar;")
+        .build();
+
+    // `baz` links the patched `bar`, so it is checked against the same `bar`
+    // as `foo`; `qux` links nothing local and is still built.
+    fork_cargo(&p, "check")
+        .with_stderr_data(
+            str![[r#"
+[UPDATING] `dummy-registry` index
+[LOCKING] 3 packages to highest compatible versions
+[DOWNLOADING] crates ...
+[DOWNLOADED] baz v1.0.0 (registry `dummy-registry`)
+[DOWNLOADED] qux v1.0.0 (registry `dummy-registry`)
+[CHECKING] bar v1.0.0 ([ROOT]/foo/bar)
+[CHECKING] baz v1.0.0
+[COMPILING] qux v1.0.0
+[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]]
+            .unordered(),
+        )
+        .run();
+    fork_cargo(&p, "build")
+        .with_stderr_data(
+            str![[r#"
+[COMPILING] bar v1.0.0 ([ROOT]/foo/bar)
+[COMPILING] baz v1.0.0
+[COMPILING] foo v0.1.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]]
+            .unordered(),
+        )
         .run();
 }
 

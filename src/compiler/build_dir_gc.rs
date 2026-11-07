@@ -451,6 +451,10 @@ fn collect(
             }
             let mut units = Vec::new();
             for unit in read_dirs(&pkg)? {
+                // Build scripts can also create native output directories here.
+                if !unit.join(LAST_USE_FILE).is_file() && !unit.join("fingerprint").is_dir() {
+                    continue;
+                }
                 let last_use =
                     mtime(&unit.join(LAST_USE_FILE)).max(mtime(&unit.join("fingerprint")));
                 units.push((unit, last_use));

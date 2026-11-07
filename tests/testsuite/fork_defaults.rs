@@ -95,6 +95,57 @@ fn gc_records_build_sizes() {
 }
 
 #[cargo_test]
+fn gc_preserves_native_outputs_outside_build_script_unit() {
+    let p = project()
+        .file(
+            "build.rs",
+            r#"
+            use std::{env, fs, path::PathBuf};
+
+            fn main() {
+                println!("cargo:rerun-if-changed=build.rs");
+                let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+                // Match rusty_v8's calculation of target/<profile>/gn_out/obj.
+                let profile = out.parent().unwrap().parent().unwrap().parent().unwrap();
+                let native = profile.join("gn_out/obj");
+                fs::create_dir_all(&native).unwrap();
+                let count = native.join("build-count");
+                let runs: u32 = fs::read_to_string(&count)
+                    .unwrap_or_default().parse().unwrap_or(0);
+                fs::write(count, (runs + 1).to_string()).unwrap();
+                let archive = if cfg!(windows) { "native_probe.lib" } else { "libnative_probe.a" };
+                fs::write(native.join(archive), b"!<arch>\n").unwrap();
+                println!("cargo:rustc-link-search=native={}", native.display());
+                println!("cargo:rustc-link-lib=static=native_probe");
+            }
+            "#,
+        )
+        .file("src/lib.rs", "#[test] fn t() {}")
+        .build();
+
+    // The first target links successfully before post-build GC runs.
+    fork_cargo(&p, "test --lib --no-run")
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_BUILD_GC_MAX_SIZE", "1 KiB")
+        .run();
+    let native = shared_build_dir().join("debug/build/gn_out/obj");
+    let archive = if cfg!(windows) {
+        "native_probe.lib"
+    } else {
+        "libnative_probe.a"
+    };
+    assert!(native.join(archive).is_file());
+
+    // The library target reuses the script's link-search output.
+    fork_cargo(&p, "build --lib")
+        .env("CARGO_BUILD_GC_FREQUENCY", "always")
+        .env("CARGO_BUILD_GC_MAX_SIZE", "1 KiB")
+        .run();
+    assert_eq!(fs::read_to_string(native.join("build-count")).unwrap(), "1");
+    assert!(native.join(archive).is_file());
+}
+
+#[cargo_test]
 fn check_and_build_share_registry_dependencies() {
     Package::new("bar", "1.0.0")
         .file("src/lib.rs", "pub fn bar() {}")

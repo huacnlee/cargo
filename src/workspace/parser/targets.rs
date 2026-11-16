@@ -10,19 +10,20 @@
 //! It is a bit tricky because we need match explicit information from `Cargo.toml`
 //! with implicit info in directory layout.
 
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use cargo_util::paths;
+use cargo_util_schemas::core::CrateType;
 use cargo_util_schemas::manifest::{
     PathValue, StringOrVec, TomlBenchTarget, TomlBinTarget, TomlExampleTarget, TomlLibTarget,
     TomlManifest, TomlPackageBuild, TomlTarget, TomlTestTarget,
 };
 
-use crate::compiler::{CrateType, rustdoc::RustdocScrapeExamples};
+use crate::compiler::rustdoc::RustdocScrapeExamples;
 use crate::util::{closest_msg, errors::CargoResult, restricted_names};
 use crate::workspace::parser::deprecated_underscore;
 use crate::workspace::{Edition, Feature, Features, Target};
@@ -124,7 +125,7 @@ pub(super) fn to_targets(
     if let Some(metabuild) = metabuild {
         // Verify names match available build deps.
         let bdeps = normalized_toml.build_dependencies.as_ref();
-        for name in &metabuild.0 {
+        for name in metabuild.iter() {
             if !bdeps.map_or(false, |bd| bd.contains_key(name.as_str())) {
                 anyhow::bail!(
                     "metabuild package `{}` must be specified in `build-dependencies`",

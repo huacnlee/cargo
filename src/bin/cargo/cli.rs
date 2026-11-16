@@ -1,8 +1,8 @@
-use crate::util::data_structures::HashMap;
 use anyhow::{Context as _, anyhow};
 use cargo::context::TermConfig;
 use cargo::workspace::{CliUnstable, features};
 use cargo::{CargoResult, drop_print, drop_println};
+use cargo_util::collections::HashMap;
 use cargo_util_terminal::report::Level;
 use clap::builder::UnknownArgumentValueParser;
 use itertools::Itertools;
@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt::Write;
 
+use super::CommandInfo;
 use super::commands;
 use super::list_commands;
 use super::third_party_subcommands;
@@ -488,7 +489,10 @@ impl Exec {
     #[tracing::instrument(skip_all)]
     fn exec(self, gctx: &mut GlobalContext, subcommand_args: &ArgMatches) -> CliResult {
         match self {
-            Self::Builtin(exec) => exec(gctx, subcommand_args),
+            Self::Builtin(exec) => {
+                warn_mixed_zero_values(gctx, subcommand_args)?;
+                exec(gctx, subcommand_args)
+            }
             Self::Manifest(cmd) => {
                 let ext_path = super::find_external_subcommand(gctx, &cmd);
                 if !gctx.cli_unstable().script && ext_path.is_some() {
@@ -528,6 +532,41 @@ impl Exec {
             }
         }
     }
+}
+
+/// Warns for an option having repeated occurrences but one of them is empty.
+///
+/// Here we check _all_ flags having the bad pattern `num_args(0..N)`.
+/// This might not be needed if clap supports showing possible candidates with dynamic values.
+/// See <https://github.com/rust-lang/cargo/issues/14606#issuecomment-2400013901>.
+fn warn_mixed_zero_values(gctx: &GlobalContext, args: &ArgMatches) -> CargoResult<()> {
+    for id in args.ids() {
+        // We use raw occurrences here because we don't need type information.
+        let Some(occurrences) = args.get_raw_occurrences(id.as_str()) else {
+            continue;
+        };
+
+        let mut has_value = false;
+        let mut has_no_value = false;
+
+        for values in occurrences {
+            if values.len() == 0 {
+                has_no_value = true;
+            } else {
+                has_value = true;
+            }
+        }
+        if has_value && has_no_value {
+            warn_ignored_zero_values(gctx, id.as_str())?;
+        }
+    }
+
+    // for nested command like `cargo report future-incompat`.
+    if let Some((_, sub_args)) = args.subcommand() {
+        warn_mixed_zero_values(gctx, sub_args)?;
+    }
+
+    Ok(())
 }
 
 #[derive(Default)]

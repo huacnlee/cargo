@@ -1,7 +1,7 @@
 use super::{CV, ConfigKey, ConfigRelativePath, GlobalContext, OptValue, PathAndArgs, StringList};
 use crate::compiler::{BuildOutput, LibraryPath, LinkArgTarget};
 use crate::util::CargoResult;
-use crate::util::data_structures::HashMap;
+use cargo_util::collections::HashMap;
 use cargo_util_terminal::report::Level;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -180,7 +180,7 @@ fn load_config_table(gctx: &GlobalContext, prefix: &[&str]) -> CargoResult<Targe
         gctx.get(prefix.iter().copied().chain(["linker"]))?;
     // Links do not support environment variables.
     let target_key = ConfigKey::from_parts(prefix);
-    let links_overrides = match gctx.get_table(&target_key)? {
+    let links_overrides = match gctx.config_reader()?.get_table(&target_key)? {
         Some(links) => parse_links_overrides(&target_key, links.val)?,
         None => BTreeMap::new(),
     };

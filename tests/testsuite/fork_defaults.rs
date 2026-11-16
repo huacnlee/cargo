@@ -229,6 +229,45 @@ fn repo_with_worktree(main: &str) -> (Project, PathBuf) {
 }
 
 #[cargo_test]
+fn clones_of_one_remote_share_a_build_dir() {
+    let (p, _wt) = repo_with_worktree("fn main() { println!(\"{}\", bar::bar()); }");
+    let upstream = p.root().to_str().unwrap().to_owned();
+    // Two clones of the same remote, each with its own `.git`, as a tool
+    // cloning a repository into every worktree would make.
+    let clones = ["clone-a", "clone-b"].map(|name| {
+        let dir = paths::root().join(name);
+        let repo = git2::Repository::clone(&upstream, &dir).unwrap();
+        repo.remote_set_url("origin", "git@example.com:org/foo.git")
+            .unwrap();
+        dir
+    });
+    git2::Repository::open(&clones[1])
+        .unwrap()
+        .remote_set_url("origin", "https://example.com/org/foo")
+        .unwrap();
+
+    fork_cargo(&p, "build")
+        .cwd(&clones[0])
+        .with_stderr_data(str![[r#"
+[COMPILING] bar v0.5.0 ([ROOT]/clone-a/bar)
+[COMPILING] foo v0.1.0 ([ROOT]/clone-a)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    // Same files in the other clone: nothing to build.
+    fork_cargo(&p, "build")
+        .cwd(&clones[1])
+        .with_stderr_data(str![[r#"
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+    shared_build_dir();
+    assert!(clones[1].join("target/debug/foo").is_file());
+}
+
+#[cargo_test]
 fn worktrees_share_workspace_units() {
     let (p, wt) = repo_with_worktree("fn main() { println!(\"{}\", bar::bar()); }");
     fork_cargo(&p, "build")

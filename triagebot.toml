@@ -117,7 +117,10 @@ trigger_files = ["crates/mdman/", "etc/man/"]
 trigger_files = ["etc/_cargo", "etc/cargo.bashcomp.sh"]
 
 [autolabel."A-configuration"]
-trigger_files = ["src/context/mod.rs"]
+trigger_files = [
+  "src/context/mod.rs",
+  "crates/cargo-util-config",
+]
 
 [autolabel."A-console-output"]
 trigger_files = [
@@ -129,7 +132,10 @@ trigger_files = [
 trigger_files = ["src/workspace/dependency.rs"]
 
 [autolabel."A-crate-types"]
-trigger_files = ["src/compiler/crate_type.rs"]
+trigger_files = [
+  "crates/cargo-util-schemas/src/core/crate_type.rs",
+  "src/compiler/crate_type.rs",
+]
 
 [autolabel."A-credential-provider"]
 trigger_files = ["credential/"]
@@ -153,7 +159,7 @@ trigger_files = ["doc/"]
 [autolabel."A-environment-variables"]
 trigger_files = [
   "crates/home/",
-  "src/context/environment.rs",
+  "crates/cargo-util-config/src/env.rs",
 ]
 
 [autolabel."A-features2"]

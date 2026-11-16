@@ -58,7 +58,11 @@
 //!   its dependencies are gone from the shared build-dir by then anyway,
 //! * then the least recently built ones are removed whole while all of them
 //!   together are larger than `build.gc.projects-max-size` (50 GiB by
-//!   default).
+//!   default), except those built within the last 6 hours, so that working
+//!   on more projects than fit does not rebuild them over and over,
+//! * and while the disk has less than 5% free (at most 20 GiB), the least
+//!   recently built ones go whatever their age: a full disk fails every
+//!   build. `projects-max-size = "none"` turns both off.
 //!
 //! Directories a Cargo without this build-dir (e.g. the rustup proxy's) left
 //! in the target-dir (`./target/<profile>/{deps,incremental,build,.fingerprint}`)
@@ -104,11 +108,17 @@ const VARIANT_FILE: &str = ".cargo-variant";
 const LAST_GC_FILE: &str = ".cargo-gc-last";
 /// `<unix seconds> <bytes>` lines: what each recent build used.
 const BUILD_SIZES_FILE: &str = ".cargo-gc-sizes";
+/// The size of a whole project build-dir when it was last measured.
+const SIZE_CACHE_FILE: &str = ".cargo-gc-du";
 
 const DEFAULT_MAX_UNUSED: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_SHARED_MAX_UNUSED: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_SHARED_MAX_SIZE: u64 = 50 * 1024 * 1024 * 1024;
 const DEFAULT_PROJECTS_MAX_SIZE: u64 = 50 * 1024 * 1024 * 1024;
+/// Projects built this recently are kept over `build.gc.projects-max-size`.
+const RECENT_PROJECT: Duration = Duration::from_secs(6 * 60 * 60);
+/// The most free space a collection keeps on the disk, see [`min_free_space`].
+const MAX_MIN_FREE_SPACE: u64 = 20 * 1024 * 1024 * 1024;
 /// How long the target-dir directories of another Cargo must be left alone
 /// before they are removed, so that a build running with it is not disturbed.
 const FOREIGN_OUTPUTS_MAX_UNUSED: Duration = Duration::from_secs(60 * 60);
@@ -797,29 +807,132 @@ fn collect_idle_projects(
     let mut sized = projects
         .into_iter()
         .map(|(dir, idle)| {
-            let size = cargo_util::du(&dir, &[]).unwrap_or(0);
+            let size = project_size(&dir);
             (dir, idle, size)
         })
         .collect::<Vec<_>>();
-    let mut total: u64 = sized.iter().map(|(_, _, size)| size).sum();
-    debug!("project build-dirs are {total} bytes (limit {max_size})");
     // Least recently built first.
     sized.sort_by(|a, b| b.1.cmp(&a.1));
-    for (dir, _, size) in sized {
-        if total <= max_size {
+    let total: u64 = sized.iter().map(|(_, _, size)| size).sum();
+    let short_of_free = disk_space(targets)
+        .map(|(free, size)| min_free_space(size).saturating_sub(free))
+        .unwrap_or(0);
+    debug!(
+        "project build-dirs are {total} bytes (limit {max_size}), \
+         disk short of {short_of_free} free bytes"
+    );
+    evict_projects(targets, sized, total, max_size, short_of_free, removed)
+}
+
+/// Removes whole projects, `sized` least recently built first, see
+/// [`collect_idle_projects`].
+fn evict_projects(
+    targets: &Path,
+    sized: Vec<(PathBuf, Duration, u64)>,
+    mut total: u64,
+    max_size: u64,
+    short_of_free: u64,
+    removed: &mut Removed,
+) -> CargoResult<()> {
+    // Over the limit: projects built recently stay, so that switching between
+    // more projects than fit does not rebuild them over and over.
+    let mut freed = 0;
+    let mut left = Vec::with_capacity(sized.len());
+    for (dir, idle, size) in sized {
+        if total > max_size && idle > RECENT_PROJECT && remove_project(targets, &dir, removed)? {
+            total = total.saturating_sub(size);
+            freed += size;
+        } else {
+            left.push((dir, size));
+        }
+    }
+    // A nearly full disk fails every build: then any project not being built
+    // goes, least recently built first.
+    for (dir, size) in left {
+        if freed >= short_of_free {
             break;
         }
         if remove_project(targets, &dir, removed)? {
-            total = total.saturating_sub(size);
+            freed += size;
         }
     }
     Ok(())
+}
+
+/// The size of a project's build-dir, cached in [`SIZE_CACHE_FILE`]: a
+/// project no build has used since it was measured has not grown, so the
+/// projects of a machine with many of them are not walked every time.
+fn project_size(dir: &Path) -> u64 {
+    let cache = dir.join(SIZE_CACHE_FILE);
+    // Without `.cargo-gc-sizes` the last use comes from the directories, which
+    // writing the cache would change.
+    let cacheable = dir.join(BUILD_SIZES_FILE).is_file();
+    if cacheable
+        && let Ok(last_use) = last_project_use(dir)
+        && mtime(&cache) > last_use
+        && let Some(size) = fs::read_to_string(&cache)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    {
+        return size;
+    }
+    let size = cargo_util::du(dir, &[]).unwrap_or(0);
+    if cacheable {
+        let _ = fs::write(&cache, size.to_string());
+    }
+    size
+}
+
+/// The free space a collection keeps on the disk of the build-dirs: 5% of
+/// it, at most [`MAX_MIN_FREE_SPACE`].
+fn min_free_space(disk_size: u64) -> u64 {
+    (disk_size / 20).min(MAX_MIN_FREE_SPACE)
+}
+
+/// `(available, total)` bytes of the file system holding `path`.
+#[cfg(unix)]
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stat` is written on success.
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` succeeded.
+    let stat = unsafe { stat.assume_init() };
+    let block = stat.f_frsize as u64;
+    Some((stat.f_bavail as u64 * block, stat.f_blocks as u64 * block))
+}
+
+#[cfg(windows)]
+fn disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let (mut available, mut total) = (0u64, 0u64);
+    // SAFETY: `wide` is NUL-terminated; the out pointers are valid or null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some((available, total))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn disk_space(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 /// Removes what only the next edit of an idle project would use: its
 /// incremental dirs, and `tmp/` entries unused for `max_unused`. Its build
 /// units stay, so building it again as it was rebuilds nothing.
 fn strip_idle_project(dir: &Path, max_unused: Duration, removed: &mut Removed) -> CargoResult<()> {
+    let before = removed.bytes;
     for profile in profile_dirs(dir)? {
         for incremental in read_dirs(&profile.join("incremental"))? {
             remove(&incremental, removed)?;
@@ -829,6 +942,9 @@ fn strip_idle_project(dir: &Path, max_unused: Duration, removed: &mut Removed) -
     tmp_candidates(&dir.join("tmp"), TMP_DEPTH, max_unused, &mut stale)?;
     for c in stale {
         remove(&c.path, removed)?;
+    }
+    if removed.bytes != before {
+        let _ = fs::remove_file(dir.join(SIZE_CACHE_FILE));
     }
     Ok(())
 }
@@ -1214,10 +1330,9 @@ mod tests {
         let newest = built_project(&tmp, "newest-1", 0, size);
         let middle = built_project(&tmp, "middle-1", 0, size);
         let oldest = built_project(&tmp, "oldest-1", 0, size);
-        let hours_ago =
-            |h: i64| FileTime::from_unix_time(FileTime::now().unix_seconds() - h * 3600, 0);
-        filetime::set_file_mtime(middle.join(BUILD_SIZES_FILE), hours_ago(2)).unwrap();
-        filetime::set_file_mtime(oldest.join(BUILD_SIZES_FILE), hours_ago(3)).unwrap();
+        filetime::set_file_mtime(newest.join(BUILD_SIZES_FILE), hours_ago(7)).unwrap();
+        filetime::set_file_mtime(middle.join(BUILD_SIZES_FILE), hours_ago(8)).unwrap();
+        filetime::set_file_mtime(oldest.join(BUILD_SIZES_FILE), hours_ago(9)).unwrap();
         let current = built_project(&tmp, "current-1", 5, size);
 
         let mut removed = Removed::default();
@@ -1236,6 +1351,64 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&tmp);
         assert_eq!(result, (true, true, false, true, 1));
+    }
+
+    fn hours_ago(hours: i64) -> FileTime {
+        FileTime::from_unix_time(FileTime::now().unix_seconds() - hours * 3600, 0)
+    }
+
+    #[test]
+    fn recent_projects_stay_unless_the_disk_is_full() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-evict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let projects = [("old-1", 9), ("recent-1", 2), ("newest-1", 1)].map(|(name, hours)| {
+            let dir = built_project(&tmp, name, 0, 1);
+            (dir, Duration::from_secs(hours * 3600), 100)
+        });
+        let left = |projects: &[(PathBuf, Duration, u64)]| {
+            projects
+                .iter()
+                .map(|(d, _, _)| d.exists())
+                .collect::<Vec<_>>()
+        };
+
+        // Over the limit: only the project not built recently goes.
+        let mut removed = Removed::default();
+        evict_projects(&tmp, projects.to_vec(), 300, 50, 0, &mut removed).unwrap();
+        let over_limit = (left(&projects), removed.projects);
+
+        // Short of free space: recent ones go too, oldest first, until enough.
+        evict_projects(&tmp, projects.to_vec(), 200, u64::MAX, 150, &mut removed).unwrap();
+        let disk_full = (left(&projects), removed.projects);
+        let _ = fs::remove_dir_all(&tmp);
+        assert_eq!(over_limit, (vec![false, true, true], 1));
+        assert_eq!(disk_full, (vec![false, false, false], 3));
+    }
+
+    #[test]
+    fn project_sizes_are_cached_until_the_next_build() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-du-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let dir = built_project(&tmp, "foo-1", 2, 4096);
+        let measured = project_size(&dir);
+        // Not walked again: a stale cache shows.
+        fs::write(dir.join(SIZE_CACHE_FILE), "7").unwrap();
+        let cached = project_size(&dir);
+        // A build since makes it measure again.
+        filetime::set_file_mtime(dir.join(SIZE_CACHE_FILE), days_ago(3)).unwrap();
+        let rebuilt = project_size(&dir);
+        let _ = fs::remove_dir_all(&tmp);
+        assert!(measured >= 2 * 4096, "{measured}");
+        assert_eq!(cached, 7);
+        // Measured again (now with the cache file in it).
+        assert!(rebuilt >= measured && rebuilt < measured + 64, "{rebuilt}");
+    }
+
+    #[test]
+    fn free_space_kept() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(min_free_space(100 * gib), 5 * gib);
+        assert_eq!(min_free_space(1000 * gib), 20 * gib);
     }
 
     #[test]

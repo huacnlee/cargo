@@ -184,7 +184,10 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   coming back rebuilds nothing); one not built for 7 days (a deleted
   checkout, a repository you stopped working on, the worktree of a finished
   task) is removed whole; and all of them together fit 50 GiB, the least
-  recently built going first.
+  recently built going first, except those built in the last 6 hours, so
+  moving between more projects than fit does not rebuild them over and over.
+  When the disk has less than 5% free (at most 20 GiB), the least recently
+  built projects go whatever their age: a full disk fails every build.
   The units an edit replaces are removed right away, unless another worktree
   uses them. A shared dependency rebuilt because something below it changed
   (a `cargo update`, another project's lockfile, a new snapshot of a git

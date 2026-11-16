@@ -7,8 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-#[cfg(feature = "unstable-schema")]
-use std::collections::HashMap;
 use std::fmt::{self, Display, Write};
 use std::path::PathBuf;
 use std::str;
@@ -163,7 +161,6 @@ pub struct InheritablePackage {
     pub badges: Option<BTreeMap<String, BTreeMap<String, String>>>,
     pub exclude: Option<Vec<String>>,
     pub include: Option<Vec<String>>,
-    #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
     pub rust_version: Option<RustVersion>,
 }
 
@@ -178,7 +175,6 @@ pub struct InheritablePackage {
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 pub struct TomlPackage {
     pub edition: Option<InheritableString>,
-    #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
     pub rust_version: Option<InheritableRustVersion>,
     #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
     pub name: Option<PackageName>,
@@ -371,16 +367,30 @@ impl<'de> de::Deserialize<'de> for InheritableSemverVersion {
     where
         D: de::Deserializer<'de>,
     {
-        UntaggedEnumVisitor::new()
-            .expecting("SemVer version")
-            .string(
-                |value| match value.trim().parse().map_err(de::Error::custom) {
-                    Ok(parsed) => Ok(InheritableField::Value(parsed)),
-                    Err(e) => Err(e),
-                },
-            )
-            .map(|value| value.deserialize().map(InheritableField::Inherit))
-            .deserialize(d)
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = InheritableSemverVersion;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("SemVer version")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                value
+                    .trim()
+                    .parse()
+                    .map(InheritableField::Value)
+                    .map_err(E::custom)
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                TomlInheritedField::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(InheritableField::Inherit)
+            }
+        }
+
+        d.deserialize_any(Visitor)
     }
 }
 
@@ -599,25 +609,6 @@ impl<'de> de::Deserialize<'de> for InheritableVecStringOrBool {
     }
 }
 
-pub type InheritableBtreeMap = InheritableField<BTreeMap<String, BTreeMap<String, String>>>;
-
-impl<'de> de::Deserialize<'de> for InheritableBtreeMap {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        let value = serde_value::Value::deserialize(deserializer)?;
-
-        if let Ok(w) = TomlInheritedField::deserialize(
-            serde_value::ValueDeserializer::<D::Error>::new(value.clone()),
-        ) {
-            return Ok(InheritableField::Inherit(w));
-        }
-        BTreeMap::deserialize(serde_value::ValueDeserializer::<D::Error>::new(value))
-            .map(InheritableField::Value)
-    }
-}
-
 #[derive(Deserialize, Serialize, Copy, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
@@ -643,6 +634,7 @@ impl Default for TomlInheritedField {
 #[serde(try_from = "bool")]
 #[serde(into = "bool")]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "unstable-schema", schemars(extend("type" = "boolean", "enum" = [true])))]
 struct WorkspaceValue;
 
 impl TryFrom<bool> for WorkspaceValue {
@@ -697,29 +689,44 @@ impl<'de> de::Deserialize<'de> for InheritableDependency {
     where
         D: de::Deserializer<'de>,
     {
-        let value = serde_value::Value::deserialize(deserializer)?;
+        struct Visitor;
 
-        if let Ok(w) = TomlInheritedDependency::deserialize(serde_value::ValueDeserializer::<
-            D::Error,
-        >::new(value.clone()))
-        {
-            if w._unused_keys.get("builtin").is_some() {
-                return Err(de::Error::custom(
-                    "`builtin` cannot be combined with `workspace = true`",
-                ));
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = InheritableDependency;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(EXPECTED_DEPENDENCY)
             }
-            return if w.workspace {
-                Ok(InheritableDependency::Inherit(w))
-            } else {
-                Err(de::Error::custom("`workspace` cannot be false"))
-            };
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                TomlDependency::deserialize(value.into_deserializer())
+                    .map(InheritableDependency::Value)
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                TomlDependency::deserialize(value.into_deserializer())
+                    .map(InheritableDependency::Value)
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                let table = AnyDependencyTable::<String>::deserialize(
+                    de::value::MapAccessDeserializer::new(map),
+                )?;
+                if table.workspace.is_some() {
+                    table.into_inherited().map(InheritableDependency::Inherit)
+                } else {
+                    Ok(InheritableDependency::Value(TomlDependency::Detailed(
+                        table.into_detailed(),
+                    )))
+                }
+            }
         }
-        TomlDependency::deserialize(serde_value::ValueDeserializer::<D::Error>::new(value))
-            .map(InheritableDependency::Value)
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 pub struct TomlInheritedDependency {
@@ -736,6 +743,12 @@ pub struct TomlInheritedDependency {
     #[serde(flatten)]
     #[cfg_attr(feature = "unstable-schema", schemars(skip))]
     pub _unused_keys: BTreeMap<String, toml::Value>,
+}
+
+impl<'de> Deserialize<'de> for TomlInheritedDependency {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        AnyDependencyTable::<String>::deserialize(deserializer)?.into_inherited()
+    }
 }
 
 impl TomlInheritedDependency {
@@ -794,37 +807,54 @@ impl TomlDependency {
     }
 }
 
+const EXPECTED_DEPENDENCY: &str = "a version string like \"0.9.8\" or a \
+                     detailed dependency like { version = \"0.9.8\" }";
+
 impl<'de, P: Deserialize<'de> + Clone> de::Deserialize<'de> for TomlDependency<P> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: de::Deserializer<'de>,
     {
-        use serde::de::Error as _;
-        let expected = "a version string like \"0.9.8\" or a \
-                     detailed dependency like { version = \"0.9.8\" }";
-        UntaggedEnumVisitor::new()
-            .expecting(expected)
-            .string(|value| Ok(TomlDependency::Simple(value.to_owned())))
-            .bool(|value| {
-                let expected = format!("invalid type: boolean `{value}`, expected {expected}");
-                let err = if value {
-                    format!(
-                        "{expected}\n\
-                    note: if you meant to use a workspace member, you can write\n \
-                      dep.workspace = {value}"
-                    )
-                } else {
-                    expected
-                };
+        struct Visitor<P>(std::marker::PhantomData<P>);
 
-                Err(serde_untagged::de::Error::custom(err))
-            })
-            .map(|value| value.deserialize().map(TomlDependency::Detailed))
-            .deserialize(deserializer)
+        impl<'de, P: Deserialize<'de> + Clone> de::Visitor<'de> for Visitor<P> {
+            type Value = TomlDependency<P>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(EXPECTED_DEPENDENCY)
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(TomlDependency::Simple(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(TomlDependency::Simple(value))
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                let unexpected = Unexpected::Bool(value);
+                if value {
+                    Err(E::custom(format_args!(
+                        "invalid type: {unexpected}, expected {}\nnote: if you meant to use a workspace member, you can write\n dep.workspace = true",
+                        &self as &dyn de::Expected
+                    )))
+                } else {
+                    Err(E::invalid_type(unexpected, &self))
+                }
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                TomlDetailedDependency::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(TomlDependency::Detailed)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor(std::marker::PhantomData))
     }
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 pub struct TomlDetailedDependency<P: Clone = String> {
@@ -848,11 +878,7 @@ pub struct TomlDetailedDependency<P: Clone = String> {
     pub branch: Option<String>,
     pub tag: Option<String>,
     pub rev: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_builtin",
-        skip_serializing_if = "std::ops::Not::not"
-    )]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "unstable-schema", schemars(extend("const" = true)))]
     pub builtin: bool,
 
@@ -877,6 +903,157 @@ pub struct TomlDetailedDependency<P: Clone = String> {
     #[serde(flatten)]
     #[cfg_attr(feature = "unstable-schema", schemars(skip))]
     pub _unused_keys: BTreeMap<String, toml::Value>,
+}
+
+impl<'de, P: Deserialize<'de> + Clone> Deserialize<'de> for TomlDetailedDependency<P> {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(AnyDependencyTable::<P>::deserialize(deserializer)?.into_detailed())
+    }
+}
+
+// Deserialize known fields in place so errors retain their source locations.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct AnyDependencyTable<P> {
+    version: Option<String>,
+    registry: Option<RegistryName>,
+    registry_index: Option<String>,
+    path: Option<P>,
+    base: Option<PathBaseName>,
+    git: Option<String>,
+    branch: Option<String>,
+    tag: Option<String>,
+    rev: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_builtin")]
+    builtin: bool,
+    features: Option<Vec<String>>,
+    optional: Option<bool>,
+    default_features: Option<bool>,
+    #[serde(rename = "default_features")]
+    default_features2: Option<bool>,
+    package: Option<PackageName>,
+    public: Option<bool>,
+    artifact: Option<StringOrVec>,
+    lib: Option<bool>,
+    target: Option<String>,
+    workspace: Option<WorkspaceValue>,
+    #[serde(flatten)]
+    _unused_keys: BTreeMap<String, toml::Value>,
+}
+
+impl<P: Clone> AnyDependencyTable<P> {
+    fn into_detailed(self) -> TomlDetailedDependency<P> {
+        let Self {
+            version,
+            registry,
+            registry_index,
+            path,
+            base,
+            git,
+            branch,
+            tag,
+            rev,
+            builtin,
+            features,
+            optional,
+            default_features,
+            default_features2,
+            package,
+            public,
+            artifact,
+            lib,
+            target,
+            workspace,
+            mut _unused_keys,
+        } = self;
+        if let Some(workspace) = workspace {
+            _unused_keys.insert("workspace".into(), toml::Value::Boolean(workspace.into()));
+        }
+        TomlDetailedDependency {
+            version,
+            registry,
+            registry_index,
+            path,
+            base,
+            git,
+            branch,
+            tag,
+            rev,
+            builtin,
+            features,
+            optional,
+            default_features,
+            default_features2,
+            package,
+            public,
+            artifact,
+            lib,
+            target,
+            _unused_keys,
+        }
+    }
+}
+
+impl AnyDependencyTable<String> {
+    fn into_inherited<E: de::Error>(self) -> Result<TomlInheritedDependency, E> {
+        let Self {
+            version,
+            registry,
+            registry_index,
+            path,
+            base,
+            git,
+            branch,
+            tag,
+            rev,
+            builtin,
+            features,
+            optional,
+            default_features,
+            default_features2,
+            package,
+            public,
+            artifact,
+            lib,
+            target,
+            workspace,
+            mut _unused_keys,
+        } = self;
+        let workspace = workspace.ok_or_else(|| E::missing_field("workspace"))?;
+        if builtin {
+            return Err(E::custom(
+                "`builtin` cannot be combined with `workspace = true`",
+            ));
+        }
+        for (key, value) in [
+            ("version", version.map(Into::into)),
+            ("registry", registry.map(|name| name.into_inner().into())),
+            ("registry-index", registry_index.map(Into::into)),
+            ("path", path.map(Into::into)),
+            ("base", base.map(|name| name.into_inner().into())),
+            ("git", git.map(Into::into)),
+            ("branch", branch.map(Into::into)),
+            ("tag", tag.map(Into::into)),
+            ("rev", rev.map(Into::into)),
+            ("package", package.map(|name| name.into_inner().into())),
+            ("artifact", artifact.map(|value| value.into_vec().into())),
+            ("lib", lib.map(Into::into)),
+            ("target", target.map(Into::into)),
+        ] {
+            if let Some(value) = value {
+                _unused_keys.insert(key.into(), value);
+            }
+        }
+        Ok(TomlInheritedDependency {
+            workspace: workspace.into(),
+            features,
+            optional,
+            default_features,
+            default_features2,
+            public,
+            _unused_keys,
+        })
+    }
 }
 
 fn deserialize_builtin<'de, D: de::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
@@ -1104,6 +1281,7 @@ impl<'de> de::Deserialize<'de> for ProfilePackageSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "unstable-schema", schemars(extend("type" = ["string", "integer"], "enum" = [0, 1, 2, 3, "s", "z"])))]
 pub struct TomlOptLevel(pub String);
 
 impl ser::Serialize for TomlOptLevel {
@@ -1145,7 +1323,8 @@ impl<'de> de::Deserialize<'de> for TomlOptLevel {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "unstable-schema", schemars(rename_all = "kebab-case"))]
-#[cfg_attr(feature = "unstable-schema", schemars(transform = Self::schema_add_aliases))]
+#[cfg_attr(feature = "unstable-schema", schemars(extend("type" = ["string", "integer", "boolean"])))]
+#[cfg_attr(feature = "unstable-schema", schemars(transform = Self::transform))]
 pub enum TomlDebugInfo {
     None,
     LineDirectivesOnly,
@@ -1154,26 +1333,14 @@ pub enum TomlDebugInfo {
     Full,
 }
 
+// Add extra enum variants, preserving existing such "line-tables-only"
 #[cfg(feature = "unstable-schema")]
 impl TomlDebugInfo {
-    fn schema_add_aliases(schema: &mut schemars::Schema) {
-        use serde_json::Value;
-
-        if let Some(obj) = schema.as_object_mut() {
-            obj.get_mut("type").map(|v| match v {
-                Value::Array(v) => v.extend_from_slice(&["integer".into(), "boolean".into()]),
-                Value::String(s) => {
-                    let s = std::mem::replace(s, String::with_capacity(0));
-                    *v = Value::Array(vec![s.into(), "integer".into(), "boolean".into()])
-                }
-                _ => *v = Value::Array(vec!["string".into(), "integer".into(), "boolean".into()]),
-            });
-
-            if let Some(variants) = obj.get_mut("enum").and_then(|v| v.as_array_mut()) {
-                variants.reserve(5);
-                variants.extend((0..=2).map(Into::into));
-                variants.extend_from_slice(&[false.into(), true.into()]);
-            }
+    fn transform(schema: &mut schemars::Schema) {
+        if let Some(serde_json::Value::Array(variants)) = schema.get_mut("enum") {
+            variants.reserve(5);
+            variants.extend((0..=2).map(Into::into));
+            variants.extend_from_slice(&[false.into(), true.into()]);
         }
     }
 }
@@ -1510,16 +1677,27 @@ impl<'de> de::Deserialize<'de> for FeatureDefinition {
     where
         D: de::Deserializer<'de>,
     {
-        UntaggedEnumVisitor::new()
-            .seq(|seq| {
-                seq.deserialize::<Vec<String>>()
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = FeatureDefinition;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an array or map")
+            }
+
+            fn visit_seq<S: de::SeqAccess<'de>>(self, seq: S) -> Result<Self::Value, S::Error> {
+                Vec::deserialize(de::value::SeqAccessDeserializer::new(seq))
                     .map(FeatureDefinition::Array)
-            })
-            .map(|seq| {
-                seq.deserialize::<FeatureMetadata>()
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                FeatureMetadata::deserialize(de::value::MapAccessDeserializer::new(map))
                     .map(FeatureDefinition::Metadata)
-            })
-            .deserialize(d)
+            }
+        }
+
+        d.deserialize_any(Visitor)
     }
 }
 
@@ -1637,12 +1815,26 @@ impl<'de> Deserialize<'de> for TomlLint {
     where
         D: de::Deserializer<'de>,
     {
-        UntaggedEnumVisitor::new()
-            .string(|string| {
-                TomlLintLevel::deserialize(string.into_deserializer()).map(TomlLint::Level)
-            })
-            .map(|map| map.deserialize().map(TomlLint::Config))
-            .deserialize(deserializer)
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = TomlLint;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string or map")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                TomlLintLevel::deserialize(value.into_deserializer()).map(TomlLint::Level)
+            }
+
+            fn visit_map<M: de::MapAccess<'de>>(self, map: M) -> Result<Self::Value, M::Error> {
+                TomlLintConfig::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(TomlLint::Config)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -1679,7 +1871,7 @@ pub struct TomlLintConfig {
     #[serde(flatten)]
     #[cfg_attr(
         feature = "unstable-schema",
-        schemars(with = "HashMap<String, TomlValueWrapper>")
+        schemars(with = "std::collections::HashMap<String, TomlValueWrapper>")
     )]
     pub config: toml::Table,
 }
@@ -1726,15 +1918,32 @@ impl<'de> de::Deserialize<'de> for InvalidCargoFeatures {
     }
 }
 
-/// This can be parsed from either a TOML string or array,
-/// but is always stored as a vector.
+/// A TOML string or an array of strings.
 #[derive(Clone, Debug, Serialize, Eq, PartialEq, PartialOrd, Ord)]
+#[serde(untagged)]
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-pub struct StringOrVec(pub Vec<String>);
+pub enum StringOrVec {
+    String(String),
+    Vec(Vec<String>),
+}
 
 impl StringOrVec {
     pub fn iter<'a>(&'a self) -> std::slice::Iter<'a, String> {
-        self.0.iter()
+        self.as_slice().iter()
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            Self::String(value) => std::slice::from_ref(value),
+            Self::Vec(values) => values,
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::String(value) => vec![value],
+            Self::Vec(values) => values,
+        }
     }
 }
 
@@ -1745,8 +1954,8 @@ impl<'de> de::Deserialize<'de> for StringOrVec {
     {
         UntaggedEnumVisitor::new()
             .expecting("string or list of strings")
-            .string(|value| Ok(StringOrVec(vec![value.to_owned()])))
-            .seq(|value| value.deserialize().map(StringOrVec))
+            .string(|value| Ok(Self::String(value.to_owned())))
+            .seq(|value| value.deserialize().map(Self::Vec))
             .deserialize(deserializer)
     }
 }

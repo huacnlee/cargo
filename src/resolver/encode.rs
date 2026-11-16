@@ -112,12 +112,12 @@
 //!   format.
 
 use super::{Resolve, ResolveVersion};
-use crate::util::data_structures::{HashMap, HashSet};
 use crate::util::errors::CargoResult;
 use crate::util::interning::InternedString;
 use crate::util::{Graph, internal};
 use crate::workspace::{Dependency, GitReference, Package, PackageId, Patch, SourceId, Workspace};
 use anyhow::{Context as _, bail};
+use cargo_util::collections::{HashMap, HashSet};
 use cargo_util_schemas::lockfile::{
     TomlLockfile, TomlLockfileDependency, TomlLockfilePackageId, TomlLockfilePatch,
     TomlLockfileSourceId,
@@ -536,24 +536,24 @@ impl ser::Serialize for Resolve {
             Some(metadata)
         };
 
-        let patch = TomlLockfilePatch {
-            unused: self
-                .unused_patches()
-                .iter()
-                .map(|id| TomlLockfileDependency {
-                    name: id.name().to_string(),
-                    version: id.version().to_string(),
-                    source: encodable_source_id(id.source_id(), self.version()),
-                    dependencies: None,
-                    replace: None,
-                    checksum: if self.version() >= ResolveVersion::V2 {
-                        self.checksums().get(id).and_then(|x| x.clone())
-                    } else {
-                        None
-                    },
-                })
-                .collect(),
-        };
+        let mut unused = self
+            .unused_patches()
+            .iter()
+            .map(|id| TomlLockfileDependency {
+                name: id.name().to_string(),
+                version: id.version().to_string(),
+                source: encodable_source_id(id.source_id(), self.version()),
+                dependencies: None,
+                replace: None,
+                checksum: if self.version() >= ResolveVersion::V2 {
+                    self.checksums().get(id).and_then(|x| x.clone())
+                } else {
+                    None
+                },
+            })
+            .collect::<Vec<_>>();
+        unused.sort();
+        let patch = TomlLockfilePatch { unused };
         TomlLockfile {
             package: Some(encodable),
             root: None,

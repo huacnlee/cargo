@@ -104,6 +104,7 @@ mod features_namespaced;
 mod fetch;
 mod fix;
 mod fix_n_times;
+mod flags_without_value;
 mod fork_defaults;
 mod freshness;
 mod freshness_checksum;

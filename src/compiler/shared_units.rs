@@ -45,7 +45,7 @@ use tracing::debug;
 use crate::compiler::fingerprint;
 use crate::compiler::{BuildContext, CompileMode, Unit};
 use crate::util::GlobalContext;
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 use crate::util::{CargoResult, StableHasher, short_hash};
 use crate::workspace::{Package, PackageId, Target};
 

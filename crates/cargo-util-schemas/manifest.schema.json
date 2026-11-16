@@ -232,9 +232,13 @@
           ]
         },
         "rust-version": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InheritableField"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "name": {
@@ -512,7 +516,10 @@
       ]
     },
     "WorkspaceValue": {
-      "type": "boolean"
+      "type": "boolean",
+      "enum": [
+        true
+      ]
     },
     "InheritableField2": {
       "description": "An enum that allows for inheriting keys from a workspace in a Cargo.toml.",
@@ -567,11 +574,18 @@
       ]
     },
     "StringOrVec": {
-      "description": "This can be parsed from either a TOML string or array,\nbut is always stored as a vector.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
+      "description": "A TOML string or an array of strings.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
     },
     "InheritableField4": {
       "description": "An enum that allows for inheriting keys from a workspace in a Cargo.toml.",
@@ -799,10 +813,6 @@
             "null"
           ]
         },
-        "builtin": {
-          "type": "boolean",
-          "const": true
-        },
         "registry": {
           "type": [
             "string",
@@ -851,6 +861,10 @@
             "string",
             "null"
           ]
+        },
+        "builtin": {
+          "type": "boolean",
+          "const": true
         },
         "features": {
           "type": [
@@ -1491,7 +1505,18 @@
       }
     },
     "TomlOptLevel": {
-      "type": "string"
+      "type": [
+        "string",
+        "integer"
+      ],
+      "enum": [
+        0,
+        1,
+        2,
+        3,
+        "s",
+        "z"
+      ]
     },
     "TomlDebugInfo": {
       "type": [

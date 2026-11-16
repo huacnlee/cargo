@@ -3,13 +3,20 @@
 #
 #   curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh
 #   sh install.sh --uninstall   # put the rustup proxy back
+#
+# rustup puts its proxy back on `rustup self update` (which `rustup update`
+# runs), and from then on every build silently uses the stock Cargo. So this
+# also turns off rustup's automatic self-update, and installs a guard (a
+# launchd agent on macOS, a systemd user unit on Linux) that puts this cargo
+# back whenever something replaces it. `--no-guard` skips the guard.
 set -eu
 
 version="${CARGO_FORK_VERSION:-latest}"
 destination="${CARGO_FORK_INSTALL_DIR:-${CARGO_HOME:-$HOME/.cargo}/bin}"
 uninstall=
+guard=1
 usage() {
-  printf '%s\n' 'Usage: install.sh [--version VERSION] [--dir DIRECTORY] [--uninstall]' \
+  printf '%s\n' 'Usage: install.sh [--version VERSION] [--dir DIRECTORY] [--no-guard] [--uninstall]' \
     'Defaults: latest release, installed as $CARGO_HOME/bin/cargo (~/.cargo/bin/cargo).' \
     'The cargo it replaces is kept as cargo.rustup; --uninstall restores it.'
 }
@@ -20,6 +27,7 @@ while [ "$#" -gt 0 ]; do
       if [ "$1" = --version ]; then version="$2"; else destination="$2"; fi
       shift 2 ;;
     --uninstall) uninstall=1; shift ;;
+    --no-guard) guard=; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -27,11 +35,38 @@ done
 die() { printf 'cargo installer: %s\n' "$*" >&2; exit 1; }
 target="$destination/cargo"
 backup="$destination/cargo.rustup"
+# What the guard restores from, and the guard itself.
+keep="$destination/.cargo-fork"
+label=com.github.huacnlee.cargo-guard
+plist="$HOME/Library/LaunchAgents/$label.plist"
+units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 is_fork() { grep -aq 'huacnlee/cargo' "$1"; }
+# Keeps what is at $target (usually a link to rustup) as $backup.
+backup_target() {
+  if [ -L "$target" ]; then ln -sfn "$(readlink "$target")" "$backup"
+  else rm -f "$backup"; cp -p "$target" "$backup"; fi
+}
+remove_guard() {
+  if [ -f "$plist" ]; then
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist"
+  fi
+  if [ -f "$units/cargo-fork-guard.path" ]; then
+    systemctl --user disable --now cargo-fork-guard.path >/dev/null 2>&1 || true
+    rm -f "$units/cargo-fork-guard.path" "$units/cargo-fork-guard.service"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+}
 
 if [ -n "$uninstall" ]; then
-  [ -e "$backup" ] || die "Nothing to restore: $backup does not exist."
+  [ -e "$backup" ] || [ -L "$backup" ] || die "Nothing to restore: $backup does not exist."
   if is_fork "$backup"; then die "$backup is huacnlee/cargo, not the original; reinstall rustup from https://rustup.rs."; fi
+  # First, or the guard would put this cargo back.
+  remove_guard
+  if [ -f "$keep/auto-self-update" ] && command -v rustup >/dev/null; then
+    rustup set auto-self-update "$(cat "$keep/auto-self-update")" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$keep"
   mv -f "$backup" "$target"
   printf 'Restored %s\n' "$target"
   exit 0
@@ -83,10 +118,10 @@ tar -xzf "$work/$asset" -C "$work/unpacked"
 "$work/unpacked/cargo" --version >/dev/null 2>&1 || die 'Downloaded cargo does not run on this system.'
 
 mkdir -p "$destination"
-# Keep the rustup proxy (or whatever cargo was there) the first time only.
-# The backup must be what this cargo replaced, never a build of this cargo.
+# Keep the rustup proxy (or whatever cargo was there), the newest one when
+# rustup put it back since. The backup must never be a build of this cargo.
 if [ -e "$backup" ] && is_fork "$backup"; then rm -f "$backup"; fi
-if [ -e "$target" ] && [ ! -e "$backup" ] && ! is_fork "$target"; then cp -p "$target" "$backup"; fi
+if { [ -e "$target" ] || [ -L "$target" ]; } && ! is_fork "$target"; then backup_target; fi
 # Rename into place so running cargo processes keep their old inode.
 staged="$(mktemp "$destination/.cargo.XXXXXXXX")"
 trap 'rm -rf "$work"; rm -f "${staged:-}"' 0
@@ -94,14 +129,86 @@ install -m755 "$work/unpacked/cargo" "$staged"
 mv -f "$staged" "$target"
 printf 'Installed %s\n' "$target"
 [ -e "$backup" ] && printf 'Previous cargo kept as %s (restore with --uninstall).\n' "$backup"
+
+mkdir -p "$keep"
+install -m755 "$target" "$keep/cargo"
+remove_guard
+if [ -n "$guard" ]; then
+  # Run by launchd or systemd whenever $destination changes: puts this cargo
+  # back if something replaced it, and follows its own updates otherwise.
+  cat > "$keep/guard.sh" <<GUARD
+#!/bin/sh
+bin='$destination'
+GUARD
+  cat >> "$keep/guard.sh" <<'GUARD'
+target="$bin/cargo"; keep="$bin/.cargo-fork/cargo"
+is_fork() { grep -aq 'huacnlee/cargo' "$1" 2>/dev/null; }
+[ -f "$keep" ] && is_fork "$keep" || exit 0
+if is_fork "$target"; then
+  cmp -s "$target" "$keep" || { cp "$target" "$keep.tmp" && chmod 755 "$keep.tmp" && mv -f "$keep.tmp" "$keep"; }
+  exit 0
+fi
+if [ -L "$target" ]; then ln -sfn "$(readlink "$target")" "$bin/cargo.rustup"
+elif [ -e "$target" ]; then rm -f "$bin/cargo.rustup"; cp -p "$target" "$bin/cargo.rustup"; fi
+staged="$(mktemp "$bin/.cargo.XXXXXXXX")" || exit 1
+cp "$keep" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$target" || { rm -f "$staged"; exit 1; }
+printf '%s put huacnlee/cargo back after %s was replaced\n' "$(date +%s)" "$target" >> "$bin/.cargo-fork/guard.log"
+GUARD
+  chmod 755 "$keep/guard.sh"
+  case "$platform" in
+    macOS)
+      mkdir -p "$(dirname "$plist")"
+      cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array><string>/bin/sh</string><string>$keep/guard.sh</string></array>
+  <key>WatchPaths</key><array><string>$destination</string></array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+      if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 || launchctl load -w "$plist" >/dev/null 2>&1; then
+        printf 'Guard installed: %s puts this cargo back if rustup replaces it.\n' "$plist"
+      else
+        rm -f "$plist"; guard=
+      fi ;;
+    Linux)
+      if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
+        mkdir -p "$units"
+        printf '%s\n' '[Unit]' 'Description=Put huacnlee/cargo back if something replaces it' '' \
+          '[Path]' "PathChanged=$destination" '' '[Install]' 'WantedBy=default.target' > "$units/cargo-fork-guard.path"
+        printf '%s\n' '[Unit]' 'Description=Put huacnlee/cargo back if something replaces it' '' \
+          '[Service]' 'Type=oneshot' "ExecStart=/bin/sh $keep/guard.sh" > "$units/cargo-fork-guard.service"
+        if systemctl --user daemon-reload && systemctl --user enable --now cargo-fork-guard.path >/dev/null 2>&1; then
+          printf 'Guard installed: systemd user unit cargo-fork-guard.path puts this cargo back if rustup replaces it.\n'
+        else
+          rm -f "$units/cargo-fork-guard.path" "$units/cargo-fork-guard.service"; guard=
+        fi
+      else guard=; fi ;;
+  esac
+  [ -n "$guard" ] || printf '%s\n' 'Note: no guard could be installed; rerun this script after `rustup self update`.'
+fi
+
 if command -v rustup >/dev/null; then
+  # `rustup update` updates rustup itself first, and that puts its proxy back
+  # in place of this cargo.
+  if [ ! -f "$keep/auto-self-update" ]; then
+    previous="$(sed -n 's/^auto_self_update *= *"\(.*\)"/\1/p' "${RUSTUP_HOME:-$HOME/.rustup}/settings.toml" 2>/dev/null || true)"
+    printf '%s\n' "${previous:-enable}" > "$keep/auto-self-update"
+  fi
+  if rustup set auto-self-update disable >/dev/null 2>&1; then
+    printf '%s\n' 'Turned off rustup self-update in `rustup update` (it would put the stock cargo back); run `rustup self update` to update rustup.'
+  fi
   # Nightly builds use Cranelift for local crates; it ships as a component.
   if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
     printf '%s\n' 'Adding the Cranelift backend to the nightly toolchain…'
     rustup component add rustc-codegen-cranelift-preview --toolchain nightly >/dev/null 2>&1 ||
       printf '%s\n' 'Cranelift is not available for this nightly; nightly builds use LLVM.'
   fi
-  printf '%s\n' 'Note: `rustup self update` reinstalls its proxies; rerun this script afterwards.'
+  [ -n "$guard" ] || printf '%s\n' 'Note: `rustup self update` reinstalls its proxies; rerun this script afterwards.'
 else
   printf '%s\n' 'Note: rustup not found; cargo will use the rustc on PATH.'
 fi

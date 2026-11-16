@@ -45,9 +45,9 @@ use tracing::debug;
 use crate::compiler::fingerprint;
 use crate::compiler::{BuildContext, CompileMode, Unit};
 use crate::util::GlobalContext;
-use crate::util::data_structures::{HashMap, HashSet};
 use crate::util::{CargoResult, StableHasher, short_hash};
 use crate::workspace::{Package, PackageId, Target};
+use cargo_util::collections::{HashMap, HashSet};
 
 /// Records which checkout built a unit, see [`Record::write`].
 const MARKER: &str = ".cargo-checkout";

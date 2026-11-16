@@ -15,8 +15,9 @@
 //! (for example, with and without tests), so we actually build a dependency
 //! graph of [`Unit`]s, which capture these properties.
 
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 
+use cargo_util_schemas::core::CrateType;
 use std::cell::RefCell;
 
 use tracing::trace;
@@ -25,7 +26,7 @@ use crate::CargoResult;
 use crate::compiler::UserIntent;
 use crate::compiler::artifact::match_artifacts_kind_with_targets;
 use crate::compiler::unit_graph::{UnitDep, UnitGraph};
-use crate::compiler::{CompileKind, CompileMode, CrateType, RustcTargetData, Unit, UnitInterner};
+use crate::compiler::{CompileKind, CompileMode, RustcTargetData, Unit, UnitInterner};
 use crate::ops::resolve_all_features;
 use crate::resolver::features::{FeaturesFor, ResolvedFeatures};
 use crate::resolver::{ForceAllTargets, HasDevUnits, Resolve};

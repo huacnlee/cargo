@@ -12,7 +12,6 @@ use crate::util::Progress;
 use crate::util::ProgressStyle;
 use crate::util::auth;
 use crate::util::cache_lock::CacheLockMode;
-use crate::util::data_structures::HashSet;
 use crate::util::errors::CargoResult;
 use crate::util::errors::HttpNotSuccessful;
 use crate::util::interning::InternedString;
@@ -23,6 +22,7 @@ use crate::workspace::SourceId;
 use crate::workspace::global_cache_tracker;
 use anyhow::Context as _;
 use cargo_credential::Operation;
+use cargo_util::collections::HashSet;
 use cargo_util::paths;
 use futures::lock::Mutex;
 use http::HeaderName;
@@ -563,7 +563,9 @@ impl<'gctx> HttpBackend<'gctx> {
                 // Not Modified: the data in the cache is still the latest.
                 Ok(LoadResponse::CacheValid)
             }
-            http::StatusCode::NOT_FOUND => {
+            http::StatusCode::NOT_FOUND
+            | http::StatusCode::GONE
+            | http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => {
                 // The crate was not found or deleted from the registry.
                 return Ok(LoadResponse::NotFound);
             }

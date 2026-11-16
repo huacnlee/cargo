@@ -4,8 +4,6 @@ use crate::context::VersionControl;
 use crate::ops::registry::RegistryOrIndex;
 use crate::ops::{self, CompileFilter, CompileOptions, NewOptions, Packages};
 use crate::resolver::{CliFeatures, ForceAllTargets, HasDevUnits};
-use crate::util::data_structures::{HashMap, HashSet};
-use crate::util::data_structures::{IndexMap, IndexSet};
 use crate::util::important_paths::find_root_manifest_for_wd;
 use crate::util::interning::InternedString;
 use crate::util::is_rustup;
@@ -18,11 +16,13 @@ use crate::workspace::Dependency;
 use crate::workspace::parser::is_embedded;
 use crate::workspace::{Edition, Package, TargetKind, Workspace, profiles::Profiles};
 use anyhow::bail;
+use cargo_util::collections::{HashMap, HashSet};
+use cargo_util::collections::{IndexMap, IndexSet};
 use cargo_util::paths;
 use cargo_util_schemas::manifest::ProfileName;
 use cargo_util_schemas::manifest::RegistryName;
-use cargo_util_schemas::manifest::StringOrVec;
 use cargo_util_terminal as shell;
+use cargo_util_terminal::report::Level;
 use clap::builder::PossibleValuesParser;
 use clap::builder::UnknownArgumentValueParser;
 use clap_complete::ArgValueCandidates;
@@ -1540,9 +1540,17 @@ pub fn ignore_unknown<T: Default>(r: Result<T, clap::parser::MatchesError>) -> T
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-pub enum CommandInfo {
-    BuiltIn { about: Option<String> },
-    External { path: PathBuf },
-    Alias { target: StringOrVec },
+/// Warns that an occurrence of a flag without a value is ignored.
+pub fn warn_ignored_zero_values(gctx: &GlobalContext, name: &str) -> CargoResult<()> {
+    gctx.shell().print_report(
+        &[Level::WARNING
+            .secondary_title(format!("`--{name}` without a value is ignored"))
+            .elements([
+                Level::NOTE.message(
+                    "this was previously accepted but will become a hard error in the future",
+                ),
+                Level::HELP.message(format!("pass a value to `--{name}` or remove it")),
+            ])],
+        false,
+    )
 }

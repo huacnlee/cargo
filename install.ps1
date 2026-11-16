@@ -99,6 +99,12 @@ try {
         rustup component add rustc-codegen-cranelift-preview --toolchain nightly *> $null
         if ($LASTEXITCODE -ne 0) { Write-Host 'Cranelift is not available for this nightly; nightly builds use LLVM.' }
     }
+    # `rustup update` updates rustup itself first, and that puts its proxy
+    # back in place of this cargo.
+    if ($rustupCommand -and -not (Test-ForkCargo $rustupCommand.Source)) {
+        rustup set auto-self-update disable *> $null
+        if ($LASTEXITCODE -eq 0) { Write-Host 'Turned off rustup self-update in `rustup update` (it would put the stock cargo back); run `rustup self update` to update rustup.' }
+    }
     Write-Host 'Note: `rustup self update` reinstalls its proxies; rerun this script afterwards.'
 } finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

@@ -185,6 +185,14 @@ fn update(home: &Path) -> CargoResult<String> {
         bail!("the downloaded cargo does not run");
     }
     install(&new, &target)?;
+    // The copy `install.sh`'s guard puts back when rustup replaces this cargo.
+    let keep = bin.join(".cargo-fork");
+    if keep.is_dir() {
+        let _ = install(
+            &new,
+            &keep.join(format!("cargo{}", env::consts::EXE_SUFFIX)),
+        );
+    }
     Ok(format!("updated {current} -> {latest}"))
 }
 

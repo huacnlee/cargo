@@ -35,7 +35,7 @@
 //! [`drain_the_queue`]: crate::compiler::job_queue
 //! ["Cargo Target"]: https://doc.rust-lang.org/nightly/cargo/reference/cargo-targets.html
 
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -44,9 +44,9 @@ use crate::compiler::unit_dependencies::build_unit_dependencies;
 use crate::compiler::unit_graph::{self, UnitDep, UnitGraph};
 use crate::compiler::{BuildConfig, BuildContext, BuildRunner, Compilation};
 use crate::compiler::{CompileKind, CompileTarget, RustcTargetData, Unit};
-use crate::compiler::{CrateType, TargetInfo, apply_env_config, standard_lib};
 use crate::compiler::{DefaultExecutor, Executor, UnitInterner};
 use crate::compiler::{DepKindSet, UnitIndex};
+use crate::compiler::{TargetInfo, apply_env_config, standard_lib};
 use crate::context::{GlobalContext, WarningHandling};
 use crate::drop_println;
 use crate::ops;
@@ -63,6 +63,7 @@ use crate::workspace::profiles::Profiles;
 use crate::workspace::{PackageId, PackageSet, SourceId, TargetKind, Workspace};
 
 mod compile_filter;
+use cargo_util_schemas::core::CrateType;
 use cargo_util_terminal::report::{Group, Level, Origin};
 pub use compile_filter::{CompileFilter, FilterRule, LibRule};
 
@@ -847,15 +848,21 @@ fn rebuild_unit_graph_shared(
     compile_time_deps_only: bool,
 ) -> (Vec<Unit>, Vec<Unit>, UnitGraph) {
     let mut result = UnitGraph::default();
+
     // Map of the old unit to the new unit, used to avoid recursing into units
     // that have already been computed to improve performance.
     let mut memo = HashMap::default();
+
+    // Map of the unit to whether the unit requires debuginfo
+    let mut debuginfo_memo = HashMap::default();
+
     let new_roots = roots
         .iter()
         .map(|root| {
             traverse_and_share(
                 interner,
                 &mut memo,
+                &mut debuginfo_memo,
                 &mut result,
                 &unit_graph,
                 root,
@@ -884,6 +891,7 @@ fn rebuild_unit_graph_shared(
 fn traverse_and_share(
     interner: &UnitInterner,
     memo: &mut HashMap<Unit, Unit>,
+    debuginfo_memo: &mut HashMap<Unit, bool>,
     new_graph: &mut UnitGraph,
     unit_graph: &UnitGraph,
     unit: &Unit,
@@ -908,6 +916,7 @@ fn traverse_and_share(
             let new_dep_unit = traverse_and_share(
                 interner,
                 memo,
+                debuginfo_memo,
                 new_graph,
                 unit_graph,
                 &dep.unit,
@@ -942,18 +951,6 @@ fn traverse_and_share(
     };
 
     let mut profile = unit.profile.clone();
-    if profile.strip.is_deferred() {
-        // If strip was not manually set, and all dependencies of this unit together
-        // with this unit have debuginfo turned off, we enable debuginfo stripping.
-        // This will remove pre-existing debug symbols coming from the standard library.
-        if !profile.debuginfo.is_turned_on()
-            && new_deps
-                .iter()
-                .all(|dep| !dep.unit.profile.debuginfo.is_turned_on())
-        {
-            profile.strip = profile.strip.strip_debuginfo();
-        }
-    }
 
     // If this is a build dependency, and it's not shared with runtime dependencies, we can weaken
     // its debuginfo level to optimize build times. We do nothing if it's an artifact dependency,
@@ -998,6 +995,17 @@ fn traverse_and_share(
         }
     }
 
+    if profile.strip.is_deferred() {
+        // If strip was not manually set, and all dependencies of this unit together
+        // with this unit have debuginfo turned off, we enable debuginfo stripping.
+        // This will remove pre-existing debug symbols coming from the standard library.
+        if !profile.debuginfo.is_turned_on()
+            && !deps_have_debuginfo(&new_deps, new_graph, debuginfo_memo)
+        {
+            profile.strip = profile.strip.strip_debuginfo();
+        }
+    }
+
     let new_unit = interner.intern(
         &unit.pkg,
         &unit.target,
@@ -1021,6 +1029,29 @@ fn traverse_and_share(
     }
     new_graph.entry(new_unit.clone()).or_insert(new_deps);
     new_unit
+}
+
+fn deps_have_debuginfo(
+    deps: &[UnitDep],
+    graph: &UnitGraph,
+    memo: &mut HashMap<Unit, bool>,
+) -> bool {
+    deps.iter().any(|dep| {
+        let unit = &dep.unit;
+        // Host deps are linked separately from their dependents.
+        if unit.target.for_host() {
+            return false;
+        }
+        if unit.profile.debuginfo.is_turned_on() {
+            return true;
+        }
+        if let Some(&has_debuginfo) = memo.get(unit) {
+            return has_debuginfo;
+        }
+        let has_debuginfo = deps_have_debuginfo(&graph[unit], graph, memo);
+        memo.insert(unit.clone(), has_debuginfo);
+        has_debuginfo
+    })
 }
 
 /// Removes duplicate `CompileMode::Doc` units that would cause problems with

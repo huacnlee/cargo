@@ -49,8 +49,16 @@ irm https://huacnlee.github.io/cargo/install.ps1 | iex
 This replaces `~/.cargo/bin/cargo` and keeps the rustup proxy as
 `cargo.rustup`.
 `cargo +nightly` and `rust-toolchain.toml` keep working. If you have a nightly
-toolchain, the installer adds its Cranelift component. `rustup self update`
-reinstalls the proxy, so rerun the installer after it.
+toolchain, the installer adds its Cranelift component.
+
+`rustup self update`, which `rustup update` runs by default, puts the rustup
+proxy back, and every build after it would quietly use the stock Cargo and
+fill each `./target` again. So the installer turns off rustup's automatic
+self-update (`rustup self update` still works), and on macOS and Linux
+installs a guard, a launchd agent or a systemd user unit, that puts this cargo
+back as soon as anything replaces it (logged in
+`~/.cargo/bin/.cargo-fork/guard.log`). `--no-guard` skips it; on Windows,
+rerun the installer after `rustup self update`.
 
 To uninstall and put the rustup proxy back:
 
@@ -140,8 +148,10 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
 ## What changes
 
 - **One build directory per project.** Your crates build in
-  `~/.cargo/targets/<name>-<hash>/`; the hash comes from the repository's main
-  `.git` directory, so every worktree lands there wherever it is created.
+  `~/.cargo/targets/<name>-<hash>/`; the hash comes from the repository's
+  `origin` remote (or, without one, its main `.git` directory), so every
+  worktree, and every clone of the same repository, lands there wherever it is
+  created.
   Binaries still appear in `./target`.
 - **Fixed directories.** `./target` and `~/.cargo/targets` cannot be moved:
   `--target-dir`, `CARGO_TARGET_DIR`, `build.target-dir` and `build.build-dir`
@@ -168,16 +178,26 @@ directories (2.3 GB and 0.4 GB) plus the shared dependencies (2.2 GB).
   units unused for a day are removed, then the least recently used ones until
   it fits twice its largest build of the last day. Shared dependencies are
   kept for 7 days, so a project you come back to after a weekend still finds
-  them, and fit 50 GiB. Projects no build has used for 7 days (a deleted
-  checkout, a repository you stopped working on) are removed whole.
+  them, and fit 50 GiB. Other projects are collected in the same pass, built
+  again or not: one not built for a day loses its incremental caches, often
+  most of its size (they only speed up the next edit; its builds stay, so
+  coming back rebuilds nothing); one not built for 7 days (a deleted
+  checkout, a repository you stopped working on, the worktree of a finished
+  task) is removed whole; and all of them together fit 50 GiB, the least
+  recently built going first, except those built in the last 6 hours, so
+  moving between more projects than fit does not rebuild them over and over.
+  When the disk has less than 5% free (at most 20 GiB), the least recently
+  built projects go whatever their age: a full disk fails every build.
   The units an edit replaces are removed right away, unless another worktree
   uses them. A shared dependency rebuilt because something below it changed
   (a `cargo update`, another project's lockfile, a new snapshot of a git
   dependency) keeps only its newest build for the week; the older ones go
   after a day. Directories in `CARGO_TARGET_TMPDIR` nothing wrote to for a
   day go too, and so do binaries in `./target` whose build unit was removed
-  (they would otherwise keep its whole size). Nothing a running build has
-  locked is removed.
+  (they would otherwise keep its whole size), and so do `deps/`,
+  `incremental/`, `build/` and `.fingerprint/` in `./target`, which only the
+  stock Cargo writes, once nothing has written to them for an hour. Nothing a
+  running build has locked is removed.
 - **No duplicate object files on macOS.** Debuggers and backtraces read the
   objects inside each rlib, so the loose copies rustc leaves beside it are
   removed.
@@ -200,6 +220,7 @@ All of these are defaults. To change one:
 [build.gc]
 max-size = "auto"     # or "15 GiB", "none"
 shared-max-size = "50 GiB"  # shared dependencies; or "none"
+projects-max-size = "50 GiB"  # all other projects together; or "none"
 max-unused = "1 day"
 shared-max-unused = "7 days"  # shared dependencies and idle projects
 frequency = "1 hour"  # or "always", "never"

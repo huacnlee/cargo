@@ -1,12 +1,13 @@
 //! See [`CompilationFiles`].
 
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 use std::cell::OnceCell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use cargo_util_schemas::core::CrateType;
 use cargo_util_schemas::manifest::TomlTrimPaths;
 use tracing::debug;
 
@@ -14,7 +15,7 @@ use super::{BuildContext, BuildRunner, CompileKind, FileFlavor, Layout};
 use crate::compiler::layout::BuildDirLayout;
 use crate::compiler::shared_units::OUT_LINKS_DIR;
 use crate::compiler::trim_paths;
-use crate::compiler::{CompileMode, CompileTarget, CrateType, FileType, Unit};
+use crate::compiler::{CompileMode, CompileTarget, FileType, Unit};
 use crate::util::{self, CargoResult, OnceExt, StableHasher};
 use crate::workspace::Target;
 use crate::workspace::TargetKind;
@@ -377,7 +378,11 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         self.unit_build_dir(unit.kind, unit).fingerprint(&dir)
     }
 
-    /// The lock location for a given build unit.
+    /// The file that stores the timestamp of a build in it's mtime
+    pub fn timestamp_file(&self, unit: &Unit) -> PathBuf {
+        self.fingerprint_dir(unit).join("invoked.timestamp")
+    }
+
     /// The directory holding every file of a build unit (new layout).
     pub fn build_unit_dir(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
@@ -389,6 +394,7 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         std::iter::once(&self.host).chain(self.target.values())
     }
 
+    /// The lock location for a given build unit.
     pub fn build_unit_lock(&self, unit: &Unit) -> PathBuf {
         let dir = self.pkg_dir(unit);
         self.unit_build_dir(unit.kind, unit)

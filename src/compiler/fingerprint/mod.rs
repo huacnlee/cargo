@@ -141,8 +141,7 @@
 //!
 //! Note that some units are a little different. A Unit for *running* a build
 //! script or for `rustdoc` does not have a dep-info file (it's not
-//! applicable). Build script `invoked.timestamp` files are in the build
-//! output directory.
+//! applicable).
 //!
 //! ## Fingerprint calculation
 //!
@@ -380,7 +379,7 @@ mod dep_info;
 mod dirty_reason;
 mod rustdoc;
 
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::ffi::OsString;

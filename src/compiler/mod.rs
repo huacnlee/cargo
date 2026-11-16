@@ -56,7 +56,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
-use crate::util::data_structures::{HashMap, HashSet};
+use cargo_util::collections::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::env;
@@ -70,6 +70,7 @@ use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context as _, Error};
 use cargo_platform::{Cfg, Platform};
+use cargo_util_schemas::core::CrateType;
 use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippet};
 use regex::Regex;
 use tracing::{debug, instrument, trace};
@@ -85,7 +86,7 @@ pub use self::build_context::TargetInfo;
 pub use self::build_runner::{BuildRunner, Metadata, UnitHash};
 pub use self::compilation::{Compilation, Doctest, UnitOutput};
 pub use self::compile_kind::{CompileKind, CompileKindFallback, CompileTarget};
-pub use self::crate_type::CrateType;
+pub use self::crate_type::CrateTypeExt;
 pub use self::custom_build::LinkArgTarget;
 pub use self::custom_build::{BuildOutput, BuildScriptOutputs, BuildScripts, LibraryPath};
 pub(crate) use self::fingerprint::DirtyReason;
@@ -408,7 +409,7 @@ fn rustc(
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let timestamp_file = build_runner.files().timestamp_file(unit);
     let script_metadatas = build_runner.find_build_script_metadatas(unit);
     let is_local = unit.is_local();
     let shared_record = build_runner
@@ -417,6 +418,7 @@ fn rustc(
         .and_then(|s| s.record(unit, &build_runner.files().build_unit_dir(unit)));
     let out_dir_link = build_runner.files().out_dir_link(unit);
     let artifact = unit.artifact;
+    let build_dir_new_layout = build_runner.bcx.gctx.cli_unstable().build_dir_new_layout;
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = if !sbom_files.is_empty() {
         Some(build_sbom(build_runner, unit)?)
@@ -457,10 +459,17 @@ fn rustc(
     }
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     return Ok(Work::new(move |state| {
-        // Artifacts are in a different location than typical units,
-        // hence we must assure the crate- and target-dependent
-        // directory is present.
-        if artifact.is_true() {
+        if build_dir_new_layout {
+            // Remove all files from the out dir to avoid overwriting a file that is hardlinked
+            // outside of build-dir.
+            if root.exists() {
+                paths::remove_dir_all(&root)?;
+            }
+            paths::create_dir_all(&root)?;
+        } else if artifact.is_true() {
+            // Artifacts are in a different location than typical units,
+            // hence we must assure the crate- and target-dependent
+            // directory is present.
             paths::create_dir_all(&root)?;
         }
 
@@ -488,28 +497,30 @@ fn rustc(
             add_custom_flags(&mut rustc, &script_outputs, script_metadatas)?;
         }
 
-        for output in outputs.iter() {
-            // If there is both an rmeta and rlib, rustc will prefer to use the
-            // rlib, even if it is older. Therefore, we must delete the rlib to
-            // force using the new rmeta.
-            if output.path.extension() == Some(OsStr::new("rmeta")) {
-                let dst = root.join(&output.path).with_extension("rlib");
-                if dst.exists() {
-                    paths::remove_file(&dst)?;
+        if !build_dir_new_layout {
+            for output in outputs.iter() {
+                // If there is both an rmeta and rlib, rustc will prefer to use the
+                // rlib, even if it is older. Therefore, we must delete the rlib to
+                // force using the new rmeta.
+                if output.path.extension() == Some(OsStr::new("rmeta")) {
+                    let dst = root.join(&output.path).with_extension("rlib");
+                    if dst.exists() {
+                        paths::remove_file(&dst)?;
+                    }
                 }
-            }
 
-            // Some linkers do not remove the executable, but truncate and modify it.
-            // That results in the old hard-link being modified even after renamed.
-            // We delete the old artifact here to prevent this behavior from confusing users.
-            // See rust-lang/cargo#8348.
-            if output.hardlink.is_some() && output.path.exists() {
-                _ = paths::remove_file(&output.path).map_err(|e| {
-                    tracing::debug!(
-                        "failed to delete previous output file `{:?}`: {e:?}",
-                        output.path
-                    );
-                });
+                // Some linkers do not remove the executable, but truncate and modify it.
+                // That results in the old hard-link being modified even after renamed.
+                // We delete the old artifact here to prevent this behavior from confusing users.
+                // See rust-lang/cargo#8348.
+                if output.hardlink.is_some() && output.path.exists() {
+                    _ = paths::remove_file(&output.path).map_err(|e| {
+                        tracing::debug!(
+                            "failed to delete previous output file `{:?}`: {e:?}",
+                            output.path
+                        );
+                    });
+                }
             }
         }
 
@@ -524,7 +535,7 @@ fn rustc(
         };
 
         state.running(&rustc);
-        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+        let timestamp = paths::set_invocation_time(&timestamp_file)?;
         if let Some(sbom) = sbom {
             for file in sbom_files {
                 tracing::debug!("writing sbom to {}", file.display());
@@ -947,6 +958,12 @@ fn prepare_rustc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResult
         base.args(args);
     }
     base.args(&unit.rustflags);
+
+    // Library unit tests should not warn about unused public items,
+    // including when the lint is enabled through RUSTFLAGS.
+    if unit.target.is_lib() && unit.mode.is_rustc_test() {
+        base.arg("-Adead_code_pub_in_binary");
+    }
     if gctx.cli_unstable().binary_dep_depinfo {
         base.arg("-Z").arg("binary-dep-depinfo");
     }
@@ -1164,7 +1181,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
         .get_cwd()
         .unwrap_or_else(|| build_runner.bcx.gctx.cwd())
         .to_path_buf();
-    let fingerprint_dir = build_runner.files().fingerprint_dir(unit);
+    let timestamp_file = build_runner.files().timestamp_file(unit);
     let is_local = unit.is_local();
     let env_config = Arc::clone(build_runner.bcx.gctx.env_config()?);
     let capture_rusage = build_runner.bcx.capture_rusage();
@@ -1237,7 +1254,7 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
             }
         };
         state.running(&rustdoc);
-        let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+        let timestamp = paths::set_invocation_time(&timestamp_file)?;
 
         let (stats, result) = rustdoc.exec_with_streaming(
             &mut |line| on_stdout_line(state, line, package_id, &target),

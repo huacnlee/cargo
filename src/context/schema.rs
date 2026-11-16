@@ -463,6 +463,12 @@ pub struct BuildDirGcConfig {
     /// dependencies (`{cargo-cache-home}/targets/shared-deps`). Defaults to
     /// 50 GiB; `"none"` disables it.
     pub shared_max_size: Option<String>,
+    /// Size limit of the build-dirs of all other projects together in
+    /// `{cargo-cache-home}/targets/`: the least recently built ones are
+    /// removed whole until they fit, except those built within 6 hours.
+    /// While the disk has less than 5% free (at most 20 GiB), they go
+    /// whatever their age. Defaults to 50 GiB; `"none"` disables both.
+    pub projects_max_size: Option<String>,
     /// How often to scan the build-dir: `"always"`, `"never"`, or a span.
     pub frequency: Option<String>,
 }

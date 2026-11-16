@@ -2215,9 +2215,12 @@ fn registry_name(gctx: &GlobalContext, sid: &SourceId) -> CargoResult<Option<Str
 ///
 /// The name is the root package's name, else the name of the git repository
 /// the workspace lives in, else the name of the workspace directory. The hash
-/// keeps same-named projects apart. It comes from the repository's main `.git`
-/// directory, which every `git worktree` points back to wherever it is
-/// created; outside git, from the workspace's path.
+/// keeps same-named projects apart. It comes from the repository's `origin`
+/// remote, so separate clones of one repository (e.g. a tool cloning it into
+/// every worktree's `target/`) share a build-dir as worktrees do; without a
+/// remote, from the repository's main `.git` directory, which every
+/// `git worktree` points back to wherever it is created; outside git, from
+/// the workspace's path.
 fn workspace_name(workspace_manifest_path: &Path) -> String {
     let root = workspace_manifest_path.parent().unwrap_or(Path::new("."));
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
@@ -2252,8 +2255,99 @@ fn workspace_name(workspace_manifest_path: &Path) -> String {
             }
         })
         .collect();
-    let identity = git_dir.unwrap_or(root);
-    format!("{name}-{}", &crate::util::hex::short_hash(&identity)[..8])
+    let hash = match git_dir {
+        Some(git_dir) => match origin_url(&git_dir) {
+            Some(url) => crate::util::hex::short_hash(&format!("git-remote:{url}")),
+            None => crate::util::hex::short_hash(&git_dir),
+        },
+        None => crate::util::hex::short_hash(&root),
+    };
+    format!("{name}-{}", &hash[..8])
+}
+
+/// The `origin` remote of the repository at `git_dir`, normalized so that
+/// the spellings of one repository agree: `git@github.com:a/b.git`,
+/// `https://github.com/a/b` and `ssh://git@github.com/a/b/` all give
+/// `github.com/a/b`. A local path is resolved against the repository.
+fn origin_url(git_dir: &Path) -> Option<String> {
+    let config = std::fs::read_to_string(git_dir.join("config")).ok()?;
+    let url = git_config_origin_url(&config)?;
+    let work_tree = git_dir.parent().unwrap_or(git_dir);
+    normalize_git_url(&url, work_tree)
+}
+
+/// `remote.origin.url` from the text of a git config file (no includes).
+fn git_config_origin_url(config: &str) -> Option<String> {
+    let mut in_origin = false;
+    let mut url = None;
+    for line in config.lines() {
+        let line = line.trim();
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.split(']').next().unwrap_or("").trim();
+            in_origin = match header.split_once(char::is_whitespace) {
+                Some((section, sub)) => {
+                    section.eq_ignore_ascii_case("remote") && sub.trim() == "\"origin\""
+                }
+                None => header.eq_ignore_ascii_case("remote.origin"),
+            };
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("url") {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            // The last value wins, as for git.
+            url = Some(value.to_owned());
+        }
+    }
+    url.filter(|u| !u.is_empty())
+}
+
+fn normalize_git_url(url: &str, base: &Path) -> Option<String> {
+    let url = url.trim();
+    let rest = if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return local_url(rest, base);
+        }
+        rest.to_owned()
+    } else {
+        // `[user@]host:path`, unless the colon comes after a slash (a path)
+        // or is a Windows drive (`C:\`).
+        match url.split_once(':') {
+            Some((host, path)) if !host.contains('/') && !host.contains('\\') && host.len() > 1 => {
+                format!("{host}/{}", path.trim_start_matches('/'))
+            }
+            _ => return local_url(url, base),
+        }
+    };
+    let (host, path) = rest.split_once('/').unwrap_or((&rest, ""));
+    let host = host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase();
+    let path = path.trim_end_matches('/');
+    let path = path
+        .strip_suffix(".git")
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{host}/{path}"))
+}
+
+fn local_url(path: &str, base: &Path) -> Option<String> {
+    let path = base.join(path);
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let path = path.to_str()?.trim_end_matches('/');
+    let path = path.strip_suffix("/.git").unwrap_or(path);
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    Some(format!("file:{path}"))
 }
 
 /// The main `.git` directory of the repository containing `dir`, resolving a
@@ -2663,6 +2757,53 @@ mod tests {
     use super::GlobalContext;
     use super::Shell;
     use super::disables_multiplexing_for_bad_curl;
+    use super::{git_config_origin_url, normalize_git_url};
+
+    #[test]
+    fn origin_url_from_git_config() {
+        let config = r#"
+[core]
+    repositoryformatversion = 0
+[remote "upstream"]
+    url = https://github.com/other/repo.git
+[remote "origin"]
+    url = git@github.com:longbridge/nsh-compat.git
+    fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+    remote = origin
+"#;
+        assert_eq!(
+            git_config_origin_url(config).as_deref(),
+            Some("git@github.com:longbridge/nsh-compat.git")
+        );
+        assert_eq!(git_config_origin_url("[core]\n\tbare = false\n"), None);
+    }
+
+    #[test]
+    fn git_urls_of_one_repository_agree() {
+        let base = std::path::Path::new("/nonexistent/repo");
+        for url in [
+            "git@github.com:longbridge/nsh-compat.git",
+            "https://github.com/longbridge/nsh-compat",
+            "https://github.com/longbridge/nsh-compat.git/",
+            "ssh://git@GitHub.com/longbridge/nsh-compat",
+            "https://user:token@github.com/longbridge/nsh-compat.git",
+        ] {
+            assert_eq!(
+                normalize_git_url(url, base).as_deref(),
+                Some("github.com/longbridge/nsh-compat"),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            normalize_git_url("/srv/git/nsh.git", base).as_deref(),
+            Some("file:/srv/git/nsh")
+        );
+        assert_eq!(
+            normalize_git_url("../nsh", base).as_deref(),
+            Some("file:/nonexistent/repo/../nsh")
+        );
+    }
 
     #[test]
     fn disables_multiplexing() {

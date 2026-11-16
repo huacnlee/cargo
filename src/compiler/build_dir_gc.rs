@@ -597,25 +597,50 @@ fn collect(
     // Drop package dirs left without any unit.
     for profile in &profiles {
         for pkg in read_dirs(&profile.join("build"))? {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(pkg.join(GC_LOCK_FILE))?;
-            match flock::try_lock_exclusive(&file) {
-                Ok(()) => {
-                    if !has_package_content(&pkg)? {
-                        paths::remove_file(&pkg.join(GC_LOCK_FILE))?;
-                        fs::remove_dir(&pkg)?;
-                    }
-                }
-                Err(fs::TryLockError::WouldBlock) => {}
-                Err(fs::TryLockError::Error(e)) => return Err(e.into()),
-            }
+            drop_empty_package(&pkg)?;
         }
     }
     Ok(())
+}
+
+/// Removes `build/<pkg>/` and its lock when no unit is left in it and no
+/// builder holds the lock. Another Cargo may remove or refill the package at
+/// any moment: that is a reason to skip it, never to fail the run. A builder
+/// waiting on the removed lock file locks the new one (see
+/// `locking::open_current_lock`).
+fn drop_empty_package(pkg: &Path) -> CargoResult<()> {
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(pkg.join(GC_LOCK_FILE))
+    {
+        Ok(file) => file,
+        Err(e) => {
+            debug!("build.gc skipping {}: {e}", pkg.display());
+            return Ok(());
+        }
+    };
+    match flock::try_lock_exclusive(&file) {
+        Ok(()) => {
+            if has_package_content(pkg).is_ok_and(|content| !content) {
+                for result in [fs::remove_file(pkg.join(GC_LOCK_FILE)), fs::remove_dir(pkg)] {
+                    if let Err(e) = result {
+                        use std::io::ErrorKind::{DirectoryNotEmpty, NotFound};
+                        if !matches!(e.kind(), NotFound | DirectoryNotEmpty) {
+                            return Err(e.into());
+                        }
+                        debug!("build.gc skipping {}: {e}", pkg.display());
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(fs::TryLockError::WouldBlock) => Ok(()),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// How deep [`tmp_candidates`] looks into `tmp/`. A test suite usually keeps
@@ -1092,7 +1117,13 @@ fn remove(path: &Path, package: Option<&Path>, removed: &mut Removed) -> CargoRe
             .truncate(false)
             .read(true)
             .write(true)
-            .open(pkg.join(GC_LOCK_FILE))?;
+            .open(pkg.join(GC_LOCK_FILE));
+        let file = match file {
+            Ok(file) => file,
+            // Another Cargo removed the empty package.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
         match flock::try_lock_exclusive(&file) {
             Ok(()) => Some(file),
             Err(fs::TryLockError::WouldBlock) => return Ok(0),
@@ -1285,6 +1316,55 @@ mod tests {
         assert!(!is_legacy_unit_dir(Path::new("build/nsh-core")));
         assert!(!is_legacy_unit_dir(Path::new("build/serde")));
         assert!(!is_legacy_unit_dir(Path::new("build/foo-0123")));
+    }
+
+    #[test]
+    fn a_package_with_only_its_lock_is_not_a_legacy_unit() {
+        let tmp =
+            std::env::temp_dir().join(format!("build-dir-gc-lock-only-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("debug/build/x-0123456789abcdef");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join(GC_LOCK_FILE), "").unwrap();
+        assert!(!has_package_content(&pkg).unwrap());
+        assert!(!is_legacy_unit_dir(&pkg));
+        let mut removed = Removed::default();
+        assert_eq!(remove(&pkg, Some(&pkg), &mut removed).unwrap(), 0);
+        assert_eq!(removed.count, 0);
+        assert_eq!(removed.bytes, 0);
+        assert!(pkg.join(GC_LOCK_FILE).exists());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn removing_zero_bytes_is_not_counted() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-zero-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let legacy = tmp.join("debug/build/old-0123456789abcdef");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("output"), "").unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(remove(&legacy, Some(&legacy), &mut removed).unwrap(), 0);
+        assert!(!legacy.join("output").exists());
+        assert_eq!(removed.count, 0);
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_vanished_package_is_not_an_error() {
+        let tmp =
+            std::env::temp_dir().join(format!("build-dir-gc-vanished-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("debug/build/gone");
+        fs::create_dir_all(&tmp).unwrap();
+        drop_empty_package(&pkg).unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(remove(&pkg, Some(&pkg), &mut removed).unwrap(), 0);
+        assert!(!pkg.exists());
+        fs::create_dir_all(&pkg).unwrap();
+        drop_empty_package(&pkg).unwrap();
+        assert!(!pkg.exists());
+        fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]

@@ -57,11 +57,13 @@ impl LockManager {
             let mut gc_locks = self.gc_locks.lock().unwrap();
             if let Entry::Vacant(entry) = gc_locks.entry(pkg_dir) {
                 let fs = Filesystem::new(entry.key().clone());
-                let lock = fs.open_ro_shared_create(
-                    GC_LOCK_FILE,
-                    build_runner.bcx.gctx,
-                    "package build directory",
-                )?;
+                let lock = open_current_lock(|| {
+                    fs.open_ro_shared_create(
+                        GC_LOCK_FILE,
+                        build_runner.bcx.gctx,
+                        "package build directory",
+                    )
+                })?;
                 entry.insert(lock);
             }
         }
@@ -121,6 +123,37 @@ impl LockManager {
     }
 }
 
+/// Takes the lock `open` returns until it is the lock of the file now at its
+/// path. GC removes the lock file of an empty package, possibly while a builder
+/// waits on it. A lock on that unlinked file guards nothing, so the builder
+/// locks the new file instead.
+fn open_current_lock(mut open: impl FnMut() -> CargoResult<FileLock>) -> CargoResult<FileLock> {
+    loop {
+        let lock = open()?;
+        if is_current_lock(&lock) {
+            return Ok(lock);
+        }
+        tracing::debug!("{} was replaced while locking it", lock.path().display());
+    }
+}
+
+/// Whether the file at the path of `lock` is the file it locks.
+#[cfg(unix)]
+fn is_current_lock(lock: &FileLock) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (lock.file().metadata(), std::fs::metadata(lock.path())) {
+        (Ok(locked), Ok(current)) => locked.dev() == current.dev() && locked.ino() == current.ino(),
+        _ => false,
+    }
+}
+
+/// Windows refuses to delete a file that is open, so the file cannot be
+/// replaced while locked.
+#[cfg(not(unix))]
+fn is_current_lock(_lock: &FileLock) -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct LockKey(PathBuf);
 
@@ -133,5 +166,60 @@ impl LockKey {
 impl Display for LockKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.display())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::GlobalContext;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn lock_is_retaken_when_its_file_is_replaced() {
+        let tmp = std::env::temp_dir().join(format!("locking-replaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let gctx = GlobalContext::default().unwrap();
+        let fs = Filesystem::new(tmp.clone());
+        let lock_path = tmp.join(GC_LOCK_FILE);
+        let mut opened: Vec<()> = Vec::new();
+        let lock = open_current_lock(|| {
+            let lock = fs.open_ro_shared_create(GC_LOCK_FILE, &gctx, "test")?;
+            opened.push(());
+            // GC drops an empty package while the builder waits for its lock.
+            if opened.len() == 1 {
+                std::fs::remove_file(&lock_path)?;
+                std::fs::remove_dir(&tmp)?;
+            } else if opened.len() == 2 {
+                std::fs::remove_file(&lock_path)?;
+            }
+            Ok(lock)
+        })
+        .unwrap();
+        assert_eq!(opened.len(), 3);
+        assert!(is_current_lock(&lock));
+        let current = std::fs::metadata(&lock_path).unwrap();
+        let held = lock.file().metadata().unwrap();
+        assert_eq!((held.dev(), held.ino()), (current.dev(), current.ino()));
+        drop(lock);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn lock_of_an_unlinked_file_is_not_current() {
+        let tmp = std::env::temp_dir().join(format!("locking-unlinked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let gctx = GlobalContext::default().unwrap();
+        let fs = Filesystem::new(tmp.clone());
+        let lock = fs
+            .open_ro_shared_create(GC_LOCK_FILE, &gctx, "test")
+            .unwrap();
+        assert!(is_current_lock(&lock));
+        std::fs::remove_file(tmp.join(GC_LOCK_FILE)).unwrap();
+        assert!(!is_current_lock(&lock));
+        std::fs::write(tmp.join(GC_LOCK_FILE), "").unwrap();
+        assert!(!is_current_lock(&lock));
+        drop(lock);
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 }

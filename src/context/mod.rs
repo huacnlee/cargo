@@ -2534,9 +2534,10 @@ mod tests {
             normalize_git_url("/srv/git/nsh.git", base).as_deref(),
             Some("file:/srv/git/nsh")
         );
+        let relative = format!("file:/nonexistent/repo{}../nsh", std::path::MAIN_SEPARATOR);
         assert_eq!(
             normalize_git_url("../nsh", base).as_deref(),
-            Some("file:/nonexistent/repo/../nsh")
+            Some(relative.as_str())
         );
     }
 

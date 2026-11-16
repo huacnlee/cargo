@@ -512,6 +512,7 @@ pub struct CargoBuildConfig {
 /// max-size = "auto" # twice the largest build of the last max-unused
 /// frequency = "1 hour"
 /// ```
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BuildDirGcConfig {

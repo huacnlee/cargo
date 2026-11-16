@@ -327,6 +327,17 @@
               "type": "null"
             }
           ]
+        },
+        "gc": {
+          "description": "Automatic garbage collection of stale build units in the build-dir.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BuildDirGcConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -515,6 +526,60 @@
           "additionalProperties": false
         }
       ]
+    },
+    "BuildDirGcConfig": {
+      "description": "Configuration for automatic build-dir garbage collection.\n\n```toml\n[build.gc]\nenabled = true\nmax-unused = \"1 day\"\nmax-size = \"auto\" # twice the largest build of the last max-unused\nfrequency = \"1 hour\"\n```",
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max-unused": {
+          "description": "Build units not used for longer than this are removed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max-size": {
+          "description": "When the build-dir grows past this size, least recently used build\nunits are removed until it fits. `\"none\"` disables the size limit;\n`\"auto\"` (the default) is twice the largest build within `max-unused`.\nCounts the whole build-dir: every target and profile.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shared-max-unused": {
+          "description": "Build units of the build-dir every project shares, and whole project\nbuild-dirs, not used for longer than this are removed. Defaults to\n7 days.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "shared-max-size": {
+          "description": "Size limit of the build-dir every project shares for registry and git\ndependencies (`{cargo-cache-home}/targets/shared-deps`). Defaults to\n50 GiB; `\"none\"` disables it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projects-max-size": {
+          "description": "Size limit of the build-dirs of all other projects together in\n`{cargo-cache-home}/targets/`: the least recently built ones are\nremoved whole until they fit, except those built within 6 hours.\nWhile the disk has less than 5% free (at most 20 GiB), they go\nwhatever their age. Defaults to 50 GiB; `\"none\"` disables both.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "frequency": {
+          "description": "How often to scan the build-dir: `\"always\"`, `\"never\"`, or a span.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     },
     "CargoCacheConfig": {
       "type": "object",

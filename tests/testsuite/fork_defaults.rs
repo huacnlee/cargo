@@ -213,7 +213,11 @@ fn clones_of_one_remote_share_a_build_dir() {
 "#]])
         .run();
     shared_build_dir();
-    assert!(clones[1].join("target/debug/foo").is_file());
+    assert!(
+        clones[1]
+            .join(format!("target/debug/foo{}", std::env::consts::EXE_SUFFIX))
+            .is_file()
+    );
 }
 
 #[cargo_test]

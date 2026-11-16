@@ -1,4 +1,4 @@
-use crate::util::data_structures::HashMap;
+use cargo_util::collections::HashMap;
 use cargo_util_terminal::report::{AnnotationKind, Group, Level, Snippet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -24,7 +24,7 @@ use pathdiff::diff_paths;
 use url::Url;
 
 use crate::compiler::{CompileKind, CompileTarget};
-use crate::context::{ConfigRelativePath, TOP_LEVEL_CONFIG_KEYS};
+use crate::context::{ConfigRelativePath, ConfigRelativePathResolveExt, TOP_LEVEL_CONFIG_KEYS};
 use crate::diagnostics::cwd_rel_path;
 use crate::diagnostics::get_key_value_span;
 use crate::resolver::ResolveBehavior;
@@ -78,7 +78,11 @@ pub fn read_manifest(
     let original_toml = deserialize_toml(&document)
         .map_err(|e| emit_toml_diagnostic(e.into(), &contents, path, gctx))?;
 
-    let document = make_document_owned(document);
+    let document = if source_id.is_path() {
+        Some(make_document_owned(document))
+    } else {
+        None
+    };
 
     let mut manifest = (|| {
         let empty = Vec::new();
@@ -105,7 +109,7 @@ pub fn read_manifest(
         if normalized_toml.package().is_some() {
             to_real_manifest(
                 Some(contents),
-                Some(document),
+                document,
                 original_toml,
                 normalized_toml,
                 features,
@@ -122,7 +126,7 @@ pub fn read_manifest(
             assert!(!is_embedded);
             to_virtual_manifest(
                 Some(contents),
-                Some(document),
+                document,
                 original_toml,
                 normalized_toml,
                 features,
@@ -1856,7 +1860,10 @@ note: only a feature named `default` will be enabled by default"
     let custom_metadata = normalized_package.metadata.clone();
     let im_a_teapot = normalized_package.im_a_teapot;
     let default_run = normalized_package.default_run.clone();
-    let metabuild = normalized_package.metabuild.clone().map(|sov| sov.0);
+    let metabuild = normalized_package
+        .metabuild
+        .clone()
+        .map(manifest::StringOrVec::into_vec);
     let manifest = Manifest::new(
         contents.map(Rc::new),
         document.map(Arc::new),
@@ -2368,7 +2375,7 @@ fn dep_to_dependency<P: ResolveToPath + Clone>(
     ) {
         if manifest_ctx.gctx.cli_unstable().bindeps {
             let artifact = Artifact::parse(
-                &artifact.0,
+                artifact.as_slice(),
                 is_lib,
                 target,
                 manifest_ctx.gctx.cli_unstable().json_target_spec,

@@ -36,14 +36,14 @@ use crate::compiler::CompileMode;
 use crate::compiler::artifact;
 use crate::compiler::build_runner::UnitHash;
 use crate::compiler::job_queue::JobState;
-use crate::util::data_structures::HashMap;
-use crate::util::data_structures::HashSet;
 use crate::util::errors::CargoResult;
 use crate::util::internal;
 use crate::util::machine_message::{self, Message};
 use crate::workspace::{PackageId, Target, profiles::ProfileRoot};
 use anyhow::{Context as _, bail};
 use cargo_platform::Cfg;
+use cargo_util::collections::HashMap;
+use cargo_util::collections::HashSet;
 use cargo_util::paths;
 use cargo_util_schemas::manifest::RustVersion;
 use std::collections::BTreeSet;
@@ -505,6 +505,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
     let build_script_outputs = Arc::clone(&build_runner.build_script_outputs);
     let id = unit.pkg.package_id();
     let run_files = BuildScriptRunFiles::for_unit(build_runner, unit);
+    let timestamp_file = build_runner.files().timestamp_file(unit);
     let host_target_root = build_runner.files().host_dest().map(|v| v.to_path_buf());
     let all = (
         id,
@@ -597,7 +598,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
 
         // And now finally, run the build command itself!
         state.running(&cmd);
-        let timestamp = paths::set_invocation_time(&run_files.root)?;
+        let timestamp = paths::set_invocation_time(&timestamp_file)?;
         let prefix = format!("[{} {}] ", id.name(), id.version());
         let mut log_messages_in_case_of_panic = Vec::new();
         let span = tracing::debug_span!("build_script", process = cmd.to_string());

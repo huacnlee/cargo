@@ -87,12 +87,12 @@ use tracing::debug;
 
 use crate::compiler::BuildRunner;
 use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
-use crate::util::data_structures::HashSet;
 use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
 use crate::util::{CargoResult, HumanBytes};
 use crate::workspace::features;
 use crate::workspace::gc::parse_human_size;
+use cargo_util::collections::HashSet;
 
 /// Marker touched in every build unit used by a build.
 const LAST_USE_FILE: &str = ".cargo-last-use";
@@ -627,7 +627,7 @@ fn remove_superseded_variants(
     if units.len() < 2 {
         return Ok(());
     }
-    let mut newest: crate::util::data_structures::HashMap<String, FileTime> = Default::default();
+    let mut newest: cargo_util::collections::HashMap<String, FileTime> = Default::default();
     let variants: Vec<Option<String>> = units
         .iter()
         .map(|(unit, last_use)| {

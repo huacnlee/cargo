@@ -1305,6 +1305,50 @@ mod tests {
     }
 
     #[test]
+    fn repeated_gc_removes_empty_packages() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-repeat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        for name in ["plain", "x-0123456789abcdef"] {
+            let pkg = tmp.join("debug/build").join(name);
+            fs::create_dir_all(pkg.join("fedcba9876543210")).unwrap();
+            fs::write(pkg.join("fedcba9876543210/output"), "old").unwrap();
+        }
+        let legacy = tmp.join("debug/build/old-0123456789abcdef");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("output"), "old").unwrap();
+        let settings = GcSettings { max_unused: Duration::ZERO, max_size: MaxSize::None, ..GcSettings::default() };
+        for run in 0..3 {
+            let mut removed = Removed::default();
+            collect(&tmp, &HashSet::default(), 0, FileTime::now(), &settings, None, &mut removed).unwrap();
+            if run > 0 { assert_eq!(removed.count, 0); }
+        }
+        assert!(read_dirs(&tmp.join("debug/build")).unwrap().is_empty());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn tmp_build_paths_have_no_package_lock() {
+        for idle in [false, true] {
+            let tmp = std::env::temp_dir().join(format!("build-dir-gc-tmp-build-{}-{idle}", std::process::id()));
+            let _ = fs::remove_dir_all(&tmp);
+            let data = tmp.join("tmp/x/build/data");
+            fs::create_dir_all(&data).unwrap();
+            fs::write(data.join("output"), "old").unwrap();
+            for path in [&data, &data.join("output")] { filetime::set_file_mtime(path, days_ago(3)).unwrap(); }
+            let mut removed = Removed::default();
+            if idle {
+                strip_idle_project(&tmp, Duration::from_secs(24 * 3600), &mut removed).unwrap();
+            } else {
+                let settings = GcSettings { max_size: MaxSize::None, ..GcSettings::default() };
+                collect(&tmp, &HashSet::default(), 0, FileTime::now(), &settings, None, &mut removed).unwrap();
+            }
+            assert!(!tmp.join("tmp/x/build").join(GC_LOCK_FILE).exists());
+            assert!(!data.exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
+    }
+
+    #[test]
     fn profile_dirs_of_a_build_dir() {
         let tmp = std::env::temp_dir().join(format!("build-dir-gc-{}", std::process::id()));
         for dir in [

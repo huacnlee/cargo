@@ -18,6 +18,8 @@
 use cargo_util::collections::{HashMap, HashSet};
 
 use cargo_util_schemas::core::CrateType;
+use std::cell::RefCell;
+
 use tracing::trace;
 
 use crate::CargoResult;
@@ -72,6 +74,8 @@ struct State<'a, 'gctx> {
     /// shares. They are then fully built for `check` and `doc` too, see
     /// [`check_or_build_mode`].
     shared_deps: bool,
+    /// Memoized [`State::is_shareable`].
+    shareable: RefCell<HashMap<(PackageId, UnitFor, CompileKind), bool>>,
 }
 
 /// A boolean-like to indicate if a `Unit` is an artifact or not.
@@ -135,6 +139,7 @@ pub fn build_unit_dependencies<'a, 'gctx>(
             && ws.gctx().cli_unstable().fine_grain_locking
             && ws.shared_deps_dir().is_some()
             && ws.gctx().get_env_os("CARGO_CHECK_SHARED_DEPS") != Some("0".as_ref()),
+        shareable: RefCell::default(),
     };
 
     let std_unit_deps = calc_deps_of_std(&mut state, std_roots)?;
@@ -332,8 +337,15 @@ fn compute_deps(
             continue;
         };
         let dep_pkg = state.get(dep_pkg_id);
-        let mode = check_or_build_mode(state, unit.mode, dep_pkg, dep_lib);
         let dep_unit_for = unit_for.with_dependency(unit, dep_lib, unit_for.root_compile_kind());
+        let mode = check_or_build_mode(
+            state,
+            unit.mode,
+            dep_pkg,
+            dep_lib,
+            dep_unit_for,
+            unit.kind.for_target(dep_lib),
+        );
 
         let manifest_deps = deps.iter().map(|d| (*d).clone()).collect::<Vec<_>>();
 
@@ -465,8 +477,21 @@ fn compute_deps(
     Ok(ret)
 }
 
+/// The Rust library linked by these dependency declarations. Artifact
+/// dependencies opt in to linking it with `lib = true`.
+fn linked_dependency_lib<'a>(pkg: &'a Package, deps: &[&Dependency]) -> Option<&'a Target> {
+    if deps
+        .iter()
+        .any(|dep| dep.artifact().is_none_or(|artifact| artifact.is_lib()))
+    {
+        pkg.library()
+    } else {
+        None
+    }
+}
+
 /// Find artifacts for all `deps` of `unit` and add units that build these artifacts
-/// to `ret`.
+/// to `ret`. Returns the dependency's Rust library if it is linked.
 fn calc_artifact_deps<'a>(
     unit: &Unit,
     unit_for: UnitFor,
@@ -475,15 +500,11 @@ fn calc_artifact_deps<'a>(
     state: &State<'a, '_>,
     ret: &mut Vec<UnitDep>,
 ) -> CargoResult<Option<&'a Target>> {
-    let mut has_artifact_lib = false;
-    let mut maybe_non_artifact_lib = false;
     let artifact_pkg = state.get(dep_id);
     for dep in deps {
         let Some(artifact) = dep.artifact() else {
-            maybe_non_artifact_lib = true;
             continue;
         };
-        has_artifact_lib |= artifact.is_lib();
         // Custom build scripts (build/compile) never get artifact dependencies,
         // but the run-build-script step does (where it is handled).
         if !unit.target.is_custom_build() {
@@ -507,11 +528,7 @@ fn calc_artifact_deps<'a>(
             )?);
         }
     }
-    if has_artifact_lib || maybe_non_artifact_lib {
-        Ok(artifact_pkg.targets().iter().find(|t| t.is_lib()))
-    } else {
-        Ok(None)
-    }
+    Ok(linked_dependency_lib(artifact_pkg, deps))
 }
 
 /// Returns the dependencies needed to run a build script.
@@ -683,8 +700,15 @@ fn compute_deps_doc(
         let dep_pkg = state.get(id);
         // Rustdoc only needs rmeta files for regular dependencies.
         // However, for plugins/proc macros, deps should be built like normal.
-        let mode = check_or_build_mode(state, unit.mode, dep_pkg, dep_lib);
         let dep_unit_for = unit_for.with_dependency(unit, dep_lib, unit_for.root_compile_kind());
+        let mode = check_or_build_mode(
+            state,
+            unit.mode,
+            dep_pkg,
+            dep_lib,
+            dep_unit_for,
+            unit.kind.for_target(dep_lib),
+        );
         let lib_unit_dep = new_unit_dep(
             state,
             unit,
@@ -780,8 +804,15 @@ fn maybe_lib(
         .iter()
         .find(|t| t.is_linkable())
         .map(|t| {
-            let mode = check_or_build_mode(state, unit.mode, &unit.pkg, t);
             let dep_unit_for = unit_for.with_dependency(unit, t, unit_for.root_compile_kind());
+            let mode = check_or_build_mode(
+                state,
+                unit.mode,
+                &unit.pkg,
+                t,
+                dep_unit_for,
+                unit.kind.for_target(t),
+            );
             new_unit_dep(
                 state,
                 unit,
@@ -868,16 +899,23 @@ fn dep_build_script(
 /// checked: their `.rmeta` serves `check`, `clippy`, rust-analyzer and `doc`
 /// as well as it serves pipelined builds, so all of them share one build of
 /// each dependency instead of checking it again and storing a second copy.
+/// Only those that link no path library, see [`State::is_shareable`].
+///
+/// `unit_for` and `kind` are those of the dependency.
 fn check_or_build_mode(
     state: &State<'_, '_>,
     mode: CompileMode,
     pkg: &Package,
     target: &Target,
+    unit_for: UnitFor,
+    kind: CompileKind,
 ) -> CompileMode {
     match mode {
         CompileMode::Check { .. } | CompileMode::Doc { .. } | CompileMode::Docscrape => {
             if target.for_host()
-                || (state.shared_deps && !state.is_std && !pkg.package_id().source_id().is_path())
+                || (state.shared_deps
+                    && !state.is_std
+                    && state.is_shareable(pkg.package_id(), unit_for, kind))
             {
                 // Plugin and proc macro targets should be compiled like
                 // normal.
@@ -1156,8 +1194,27 @@ impl<'a, 'gctx> State<'a, 'gctx> {
 
     /// Returns a filtered set of dependencies for the given unit.
     fn deps(&self, unit: &Unit, unit_for: UnitFor) -> Vec<(PackageId, Vec<&Dependency>)> {
-        let pkg_id = unit.pkg.package_id();
-        let kind = unit.kind;
+        let dev = unit.target.is_test() || unit.target.is_example() || unit.mode.is_any_test();
+        self.package_deps(
+            unit.pkg.package_id(),
+            unit.kind,
+            unit.target.is_custom_build(),
+            dev,
+            unit_for,
+        )
+    }
+
+    /// The dependencies of `pkg_id` compiled for `kind`: its build
+    /// dependencies for a build script, otherwise the others, with
+    /// dev-dependencies only if `dev`.
+    fn package_deps(
+        &self,
+        pkg_id: PackageId,
+        kind: CompileKind,
+        build_script: bool,
+        dev: bool,
+        unit_for: UnitFor,
+    ) -> Vec<(PackageId, Vec<&Dependency>)> {
         self.resolve()
             .deps(pkg_id)
             .filter_map(|(id, deps)| {
@@ -1168,17 +1225,13 @@ impl<'a, 'gctx> State<'a, 'gctx> {
                         // If this target is a build command, then we only want build
                         // dependencies, otherwise we want everything *other than* build
                         // dependencies.
-                        if unit.target.is_custom_build() != dep.is_build() {
+                        if build_script != dep.is_build() {
                             return false;
                         }
 
                         // If this dependency is **not** a transitive dependency, then it
                         // only applies to test/example targets.
-                        if !dep.is_transitive()
-                            && !unit.target.is_test()
-                            && !unit.target.is_example()
-                            && !unit.mode.is_any_test()
-                        {
+                        if !dep.is_transitive() && !dev {
                             return false;
                         }
 
@@ -1212,5 +1265,35 @@ impl<'a, 'gctx> State<'a, 'gctx> {
                 }
             })
             .collect()
+    }
+
+    /// Whether the library of `pkg_id`, compiled for `unit_for` and `kind`,
+    /// can be built where its dependents only check it: no library it links,
+    /// itself included, comes from a path.
+    ///
+    /// A built unit's dependencies are built too. A path library below it
+    /// would be built there while checked for its other dependents, and rustc
+    /// would see two different crates: a type passed through the built
+    /// dependency would not match the same type taken directly.
+    fn is_shareable(&self, pkg_id: PackageId, unit_for: UnitFor, kind: CompileKind) -> bool {
+        if pkg_id.source_id().is_path() {
+            return false;
+        }
+        let key = (pkg_id, unit_for, kind);
+        if let Some(&shareable) = self.shareable.borrow().get(&key) {
+            return shareable;
+        }
+        // A library's library dependencies keep its `unit_for` and `kind`.
+        // Proc macros and artifacts are built for a check as well, so they
+        // are not followed.
+        let shareable = self
+            .package_deps(pkg_id, kind, false, false, unit_for)
+            .into_iter()
+            .all(|(dep_id, deps)| {
+                linked_dependency_lib(self.get(dep_id), &deps)
+                    .is_none_or(|lib| lib.for_host() || self.is_shareable(dep_id, unit_for, kind))
+            });
+        self.shareable.borrow_mut().insert(key, shareable);
+        shareable
     }
 }

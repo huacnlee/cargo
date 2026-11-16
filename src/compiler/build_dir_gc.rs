@@ -622,8 +622,15 @@ fn drop_empty_package(pkg: &Path) -> CargoResult<()> {
             return Ok(());
         }
     };
+    drop_empty_package_with_file(pkg, file)
+}
+
+fn drop_empty_package_with_file(pkg: &Path, file: fs::File) -> CargoResult<()> {
     match flock::try_lock_exclusive(&file) {
         Ok(()) => {
+            if !super::locking::is_current_lock(&file, &pkg.join(GC_LOCK_FILE)) {
+                return Ok(());
+            }
             if has_package_content(pkg).is_ok_and(|content| !content) {
                 for result in [fs::remove_file(pkg.join(GC_LOCK_FILE)), fs::remove_dir(pkg)] {
                     if let Err(e) = result {
@@ -1110,8 +1117,7 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 /// Cargo holds the lock of, and incremental dirs whose session a running
 /// rustc has locked (`s-*.lock`).
 fn remove(path: &Path, package: Option<&Path>, removed: &mut Removed) -> CargoResult<u64> {
-    let is_package = package == Some(path);
-    let _gc_lock = if let Some(pkg) = package {
+    let file = if let Some(pkg) = package {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1124,8 +1130,28 @@ fn remove(path: &Path, package: Option<&Path>, removed: &mut Removed) -> CargoRe
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
         };
+        Some((pkg, file))
+    } else {
+        None
+    };
+    remove_with_file(path, package, removed, file)
+}
+
+fn remove_with_file(
+    path: &Path,
+    package: Option<&Path>,
+    removed: &mut Removed,
+    file: Option<(&Path, fs::File)>,
+) -> CargoResult<u64> {
+    let is_package = package == Some(path);
+    let _gc_lock = if let Some((pkg, file)) = file {
         match flock::try_lock_exclusive(&file) {
-            Ok(()) => Some(file),
+            Ok(()) => {
+                if !super::locking::is_current_lock(&file, &pkg.join(GC_LOCK_FILE)) {
+                    return Ok(0);
+                }
+                Some(file)
+            }
             Err(fs::TryLockError::WouldBlock) => return Ok(0),
             Err(fs::TryLockError::Error(e)) => return Err(e.into()),
         }
@@ -1304,6 +1330,72 @@ fn touch(path: &Path, time: FileTime) -> CargoResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn stale_gc_files(name: &str) -> (PathBuf, fs::File, fs::File) {
+        let pkg = std::env::temp_dir().join(format!("gc-stale-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&pkg);
+        fs::create_dir_all(&pkg).unwrap();
+        let open = || {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(pkg.join(GC_LOCK_FILE))
+                .unwrap()
+        };
+        let stale = open();
+        fs::remove_file(pkg.join(GC_LOCK_FILE)).unwrap();
+        fs::remove_dir(&pkg).unwrap();
+        fs::create_dir_all(&pkg).unwrap();
+        let builder = open();
+        flock::lock_shared(&builder).unwrap();
+        (pkg, stale, builder)
+    }
+
+    #[cfg(unix)]
+    fn assert_builder_lock_remains(pkg: &Path, builder: &fs::File) {
+        use std::os::unix::fs::MetadataExt;
+        let held = builder.metadata().unwrap();
+        let current = fs::metadata(pkg.join(GC_LOCK_FILE)).expect("builder lock must remain");
+        assert_eq!((held.dev(), held.ino()), (current.dev(), current.ino()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_gc_cannot_drop_empty_package() {
+        let (pkg, stale, builder) = stale_gc_files("empty");
+        drop_empty_package_with_file(&pkg, stale).unwrap();
+        assert_builder_lock_remains(&pkg, &builder);
+        let unit = pkg.join("0123456789abcdef");
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(unit.join("output"), "queued").unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(remove(&unit, Some(&pkg), &mut removed).unwrap(), 0);
+        assert!(unit.join("output").exists());
+        drop(builder);
+        fs::remove_dir_all(pkg).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_gc_cannot_remove_builder_unit() {
+        let (pkg, stale, builder) = stale_gc_files("unit");
+        let unit = pkg.join("0123456789abcdef");
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(unit.join("output"), "queued").unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(
+            remove_with_file(&unit, Some(&pkg), &mut removed, Some((&pkg, stale))).unwrap(),
+            0
+        );
+        assert!(unit.join("output").exists());
+        assert_builder_lock_remains(&pkg, &builder);
+        assert_eq!((removed.count, removed.bytes), (0, 0));
+        drop(builder);
+        fs::remove_dir_all(pkg).unwrap();
+    }
 
     #[test]
     fn legacy_unit_dirs() {

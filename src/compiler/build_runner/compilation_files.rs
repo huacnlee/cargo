@@ -33,6 +33,12 @@ use crate::workspace::features;
 /// use the same rustc version.
 const METADATA_VERSION: u8 = 2;
 
+fn uses_unit_local_build_script_out_dir(unit: &Unit, ws: &Workspace<'_>) -> bool {
+    unit.mode.is_run_custom_build()
+        && ws.gctx().cli_unstable().build_dir_new_layout
+        && !features::is_fork_defaults_opt_out()
+}
+
 /// Uniquely identify a [`Unit`] under specific circumstances, see [`Metadata`] for more.
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct UnitHash(u64);
@@ -355,6 +361,12 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
     ///
     /// New features should consider using this so we can avoid their migrations.
     pub fn out_dir_new_layout(&self, unit: &Unit) -> PathBuf {
+        if uses_unit_local_build_script_out_dir(unit, self.ws) {
+            // Keep the traditional build/<script>/out depth inside the unit.
+            // Scripts like rusty_v8 write to the third parent of OUT_DIR;
+            // that data must follow the unit's lock and GC lifetime.
+            return self.build_unit_dir(unit).join("build/script/out");
+        }
         let dir = self.pkg_dir(unit);
         self.unit_build_dir(unit.kind, unit)
             .out_force_new_layout(&dir)
@@ -1011,6 +1023,11 @@ fn compute_metadata(
 
     let mut unit_id_hasher = shared_hasher.clone();
     hash_metadata(ws_root, false, &mut unit_id_hasher, unit);
+    // Cached build script output may point outside the old unit directory.
+    // Run the script again and give its dependents fresh filesystem identities.
+    if uses_unit_local_build_script_out_dir(unit, bcx.ws) {
+        "unit-local-build-script-out-dir".hash(&mut unit_id_hasher);
+    }
     if let Some(content_hash) = content_hash {
         content_hash.hash(&mut unit_id_hasher);
     }

@@ -86,6 +86,7 @@ use filetime::FileTime;
 use tracing::debug;
 
 use crate::compiler::BuildRunner;
+use crate::compiler::locking::GC_LOCK_FILE;
 use crate::compiler::shared_units::{self, OUT_LINKS_DIR};
 use crate::util::flock;
 use crate::util::time_span::maybe_parse_time_span;
@@ -233,6 +234,7 @@ pub fn run(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) {
 }
 
 fn run_inner(build_runner: &BuildRunner<'_, '_>, build_start: SystemTime) -> CargoResult<()> {
+    build_runner.lock_manager.release_gc_locks();
     let gctx = build_runner.bcx.gctx;
     // The old layout mixes the files of all units in shared directories.
     if !gctx.cli_unstable().build_dir_new_layout || features::is_fork_defaults_opt_out() {
@@ -405,7 +407,7 @@ fn collect_superseded(
             }
             let users = fs::read_to_string(sibling.join(USERS_FILE)).unwrap_or_default();
             if users.lines().all(|u| u == checkout) {
-                remove(&sibling, &mut removed)?;
+                remove(&sibling, Some(pkg_dir), &mut removed)?;
             }
         }
     }
@@ -460,11 +462,16 @@ struct Removed {
 struct Candidate {
     path: PathBuf,
     last_use: FileTime,
+    package: Option<PathBuf>,
 }
 
 impl Candidate {
     fn new(path: PathBuf, last_use: FileTime) -> Candidate {
-        Candidate { path, last_use }
+        Candidate {
+            path,
+            last_use,
+            package: None,
+        }
     }
 }
 
@@ -483,7 +490,11 @@ fn collect(
     for profile in &profiles {
         for pkg in read_dirs(&profile.join("build"))? {
             if is_legacy_unit_dir(&pkg) {
-                candidates.push(Candidate::new(pkg.clone(), mtime(&pkg)));
+                candidates.push(Candidate {
+                    path: pkg.clone(),
+                    last_use: mtime(&pkg),
+                    package: Some(pkg.clone()),
+                });
                 continue;
             }
             let mut units = Vec::new();
@@ -493,13 +504,17 @@ fn collect(
                 units.push((unit, last_use));
             }
             if let Some(max_unused) = superseded_max_unused {
-                remove_superseded_variants(&mut units, live, max_unused, removed)?;
+                remove_superseded_variants(&mut units, Some(&pkg), live, max_unused, removed)?;
             }
             candidates.extend(
                 units
                     .into_iter()
                     .filter(|(unit, _)| !live.contains(unit))
-                    .map(|(unit, last_use)| Candidate::new(unit, last_use)),
+                    .map(|(unit, last_use)| Candidate {
+                        path: unit,
+                        last_use,
+                        package: Some(pkg.clone()),
+                    }),
             );
         }
         // rustc names these after the crate's `StableCrateId`, which Cargo does
@@ -521,7 +536,7 @@ fn collect(
                 .filter(|(d, _)| crate_name(d) == crate_name(dir))
                 .count();
             if rank >= KEEP_INCREMENTAL {
-                remove(dir, removed)?;
+                remove(dir, None, removed)?;
             } else if *last_use < build_start {
                 candidates.push(Candidate::new(dir.clone(), *last_use));
             }
@@ -543,7 +558,7 @@ fn collect(
     let mut kept = Vec::with_capacity(candidates.len());
     for c in candidates {
         if age(c.last_use) > settings.max_unused {
-            remove(&c.path, removed)?;
+            remove(&c.path, c.package.as_deref(), removed)?;
         } else {
             kept.push(c);
         }
@@ -575,19 +590,64 @@ fn collect(
             if total <= max_size {
                 break;
             }
-            total = total.saturating_sub(remove(&c.path, removed)?);
+            total = total.saturating_sub(remove(&c.path, c.package.as_deref(), removed)?);
         }
     }
 
     // Drop package dirs left without any unit.
     for profile in &profiles {
         for pkg in read_dirs(&profile.join("build"))? {
-            if fs::read_dir(&pkg).is_ok_and(|mut d| d.next().is_none()) {
-                let _ = fs::remove_dir(&pkg);
-            }
+            drop_empty_package(&pkg)?;
         }
     }
     Ok(())
+}
+
+/// Removes `build/<pkg>/` and its lock when no unit is left in it and no
+/// builder holds the lock. Another Cargo may remove or refill the package at
+/// any moment: that is a reason to skip it, never to fail the run. A builder
+/// waiting on the removed lock file locks the new one (see
+/// `locking::open_current_lock`).
+fn drop_empty_package(pkg: &Path) -> CargoResult<()> {
+    let file = match fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(pkg.join(GC_LOCK_FILE))
+    {
+        Ok(file) => file,
+        Err(e) => {
+            debug!("build.gc skipping {}: {e}", pkg.display());
+            return Ok(());
+        }
+    };
+    drop_empty_package_with_file(pkg, file)
+}
+
+fn drop_empty_package_with_file(pkg: &Path, file: fs::File) -> CargoResult<()> {
+    match flock::try_lock_exclusive(&file) {
+        Ok(()) => {
+            if !super::locking::is_current_lock(&file, &pkg.join(GC_LOCK_FILE)) {
+                return Ok(());
+            }
+            if has_package_content(pkg).is_ok_and(|content| !content) {
+                for result in [fs::remove_file(pkg.join(GC_LOCK_FILE)), fs::remove_dir(pkg)] {
+                    if let Err(e) = result {
+                        use std::io::ErrorKind::{DirectoryNotEmpty, NotFound};
+                        if !matches!(e.kind(), NotFound | DirectoryNotEmpty) {
+                            return Err(e.into());
+                        }
+                        debug!("build.gc skipping {}: {e}", pkg.display());
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(fs::TryLockError::WouldBlock) => Ok(()),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 /// How deep [`tmp_candidates`] looks into `tmp/`. A test suite usually keeps
@@ -620,6 +680,7 @@ fn tmp_candidates(
 /// `max_unused`, and drops them from `units`.
 fn remove_superseded_variants(
     units: &mut Vec<(PathBuf, FileTime)>,
+    package: Option<&Path>,
     live: &HashSet<PathBuf>,
     max_unused: Duration,
     removed: &mut Removed,
@@ -647,7 +708,7 @@ fn remove_superseded_variants(
         let superseded = variant.is_some_and(|v| newest[&v] > last_use)
             && !live.contains(&unit)
             && age(last_use) > max_unused;
-        if superseded && remove(&unit, removed)? > 0 {
+        if superseded && remove(&unit, package, removed)? > 0 {
             continue;
         }
         if unit.exists() {
@@ -935,13 +996,13 @@ fn strip_idle_project(dir: &Path, max_unused: Duration, removed: &mut Removed) -
     let before = removed.bytes;
     for profile in profile_dirs(dir)? {
         for incremental in read_dirs(&profile.join("incremental"))? {
-            remove(&incremental, removed)?;
+            remove(&incremental, None, removed)?;
         }
     }
     let mut stale = Vec::new();
     tmp_candidates(&dir.join("tmp"), TMP_DEPTH, max_unused, &mut stale)?;
     for c in stale {
-        remove(&c.path, removed)?;
+        remove(&c.path, c.package.as_deref(), removed)?;
     }
     if removed.bytes != before {
         let _ = fs::remove_file(dir.join(SIZE_CACHE_FILE));
@@ -1040,6 +1101,9 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
     };
     let mut profiles = Vec::new();
     for dir in read_dirs(root)? {
+        if dir == root.join("tmp") {
+            continue;
+        }
         if is_profile(&dir) {
             profiles.push(dir);
         } else {
@@ -1052,7 +1116,52 @@ fn profile_dirs(root: &Path) -> CargoResult<Vec<PathBuf>> {
 /// Removes a directory, returning the bytes freed. Skips build units another
 /// Cargo holds the lock of, and incremental dirs whose session a running
 /// rustc has locked (`s-*.lock`).
-fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
+fn remove(path: &Path, package: Option<&Path>, removed: &mut Removed) -> CargoResult<u64> {
+    let file = if let Some(pkg) = package {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(pkg.join(GC_LOCK_FILE));
+        let file = match file {
+            Ok(file) => file,
+            // Another Cargo removed the empty package.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        Some((pkg, file))
+    } else {
+        None
+    };
+    remove_with_file(path, package, removed, file)
+}
+
+fn remove_with_file(
+    path: &Path,
+    package: Option<&Path>,
+    removed: &mut Removed,
+    file: Option<(&Path, fs::File)>,
+) -> CargoResult<u64> {
+    let is_package = package == Some(path);
+    let _gc_lock = if let Some((pkg, file)) = file {
+        match flock::try_lock_exclusive(&file) {
+            Ok(()) => {
+                if !super::locking::is_current_lock(&file, &pkg.join(GC_LOCK_FILE)) {
+                    return Ok(0);
+                }
+                Some(file)
+            }
+            Err(fs::TryLockError::WouldBlock) => return Ok(0),
+            Err(fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    } else {
+        None
+    };
+    // A builder may have added new-layout units since collection began.
+    if is_package && !is_legacy_unit_dir(path) {
+        return Ok(0);
+    }
     let mut lock_files = vec![path.join(".lock")];
     if let Ok(entries) = fs::read_dir(path) {
         lock_files.extend(
@@ -1079,9 +1188,25 @@ fn remove(path: &Path, removed: &mut Removed) -> CargoResult<u64> {
     }
     let size = cargo_util::du(path, &[]).unwrap_or(0);
     debug!("build.gc removing {}", path.display());
-    paths::remove_dir_all(path)?;
-    removed.count += 1;
-    removed.bytes += size;
+    if is_package {
+        // Keep the package lock's inode stable for builders waiting on it.
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_name() != GC_LOCK_FILE {
+                if entry.file_type()?.is_dir() {
+                    paths::remove_dir_all(&entry.path())?;
+                } else {
+                    paths::remove_file(&entry.path())?;
+                }
+            }
+        }
+    } else {
+        paths::remove_dir_all(path)?;
+    }
+    if size > 0 {
+        removed.count += 1;
+        removed.bytes += size;
+    }
     Ok(size)
 }
 
@@ -1106,13 +1231,35 @@ fn crate_name(dir: &Path) -> &str {
     name.rsplit_once('-').map_or(name, |(krate, _)| krate)
 }
 
+fn has_package_content(dir: &Path) -> CargoResult<bool> {
+    for entry in fs::read_dir(dir)? {
+        if entry?.file_name() != GC_LOCK_FILE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether `dir` is an old-layout `build/<pkg>-<16 hex digits>` directory.
 fn is_legacy_unit_dir(dir: &Path) -> bool {
     let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     match name.rsplit_once('-') {
-        Some((_, hash)) => hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        Some((_, hash)) => {
+            has_package_content(dir).unwrap_or(true)
+                && hash.len() == 16
+                && hash.bytes().all(|b| b.is_ascii_hexdigit())
+                && !fs::read_dir(dir).is_ok_and(|entries| {
+                    entries.flatten().any(|entry| {
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        name.len() == 16
+                            && name.bytes().all(|b| b.is_ascii_hexdigit())
+                            && entry.path().is_dir()
+                    })
+                })
+        }
         None => false,
     }
 }
@@ -1184,6 +1331,72 @@ fn touch(path: &Path, time: FileTime) -> CargoResult<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn stale_gc_files(name: &str) -> (PathBuf, fs::File, fs::File) {
+        let pkg = std::env::temp_dir().join(format!("gc-stale-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&pkg);
+        fs::create_dir_all(&pkg).unwrap();
+        let open = || {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(pkg.join(GC_LOCK_FILE))
+                .unwrap()
+        };
+        let stale = open();
+        fs::remove_file(pkg.join(GC_LOCK_FILE)).unwrap();
+        fs::remove_dir(&pkg).unwrap();
+        fs::create_dir_all(&pkg).unwrap();
+        let builder = open();
+        flock::lock_shared(&builder).unwrap();
+        (pkg, stale, builder)
+    }
+
+    #[cfg(unix)]
+    fn assert_builder_lock_remains(pkg: &Path, builder: &fs::File) {
+        use std::os::unix::fs::MetadataExt;
+        let held = builder.metadata().unwrap();
+        let current = fs::metadata(pkg.join(GC_LOCK_FILE)).expect("builder lock must remain");
+        assert_eq!((held.dev(), held.ino()), (current.dev(), current.ino()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_gc_cannot_drop_empty_package() {
+        let (pkg, stale, builder) = stale_gc_files("empty");
+        drop_empty_package_with_file(&pkg, stale).unwrap();
+        assert_builder_lock_remains(&pkg, &builder);
+        let unit = pkg.join("0123456789abcdef");
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(unit.join("output"), "queued").unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(remove(&unit, Some(&pkg), &mut removed).unwrap(), 0);
+        assert!(unit.join("output").exists());
+        drop(builder);
+        fs::remove_dir_all(pkg).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_gc_cannot_remove_builder_unit() {
+        let (pkg, stale, builder) = stale_gc_files("unit");
+        let unit = pkg.join("0123456789abcdef");
+        fs::create_dir_all(&unit).unwrap();
+        fs::write(unit.join("output"), "queued").unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(
+            remove_with_file(&unit, Some(&pkg), &mut removed, Some((&pkg, stale))).unwrap(),
+            0
+        );
+        assert!(unit.join("output").exists());
+        assert_builder_lock_remains(&pkg, &builder);
+        assert_eq!((removed.count, removed.bytes), (0, 0));
+        drop(builder);
+        fs::remove_dir_all(pkg).unwrap();
+    }
+
     #[test]
     fn legacy_unit_dirs() {
         assert!(is_legacy_unit_dir(Path::new(
@@ -1195,6 +1408,183 @@ mod tests {
         assert!(!is_legacy_unit_dir(Path::new("build/nsh-core")));
         assert!(!is_legacy_unit_dir(Path::new("build/serde")));
         assert!(!is_legacy_unit_dir(Path::new("build/foo-0123")));
+    }
+
+    #[test]
+    fn a_package_with_only_its_lock_is_not_a_legacy_unit() {
+        let tmp =
+            std::env::temp_dir().join(format!("build-dir-gc-lock-only-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("debug/build/x-0123456789abcdef");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join(GC_LOCK_FILE), "").unwrap();
+        assert!(!has_package_content(&pkg).unwrap());
+        assert!(!is_legacy_unit_dir(&pkg));
+        let mut removed = Removed::default();
+        assert_eq!(remove(&pkg, Some(&pkg), &mut removed).unwrap(), 0);
+        assert_eq!(removed.count, 0);
+        assert_eq!(removed.bytes, 0);
+        assert!(pkg.join(GC_LOCK_FILE).exists());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn removing_zero_bytes_is_not_counted() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-zero-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let legacy = tmp.join("debug/build/old-0123456789abcdef");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("output"), "").unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(remove(&legacy, Some(&legacy), &mut removed).unwrap(), 0);
+        assert!(!legacy.join("output").exists());
+        assert_eq!(removed.count, 0);
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn dropping_a_vanished_package_is_not_an_error() {
+        let tmp =
+            std::env::temp_dir().join(format!("build-dir-gc-vanished-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("debug/build/gone");
+        fs::create_dir_all(&tmp).unwrap();
+        drop_empty_package(&pkg).unwrap();
+        let mut removed = Removed::default();
+        assert_eq!(remove(&pkg, Some(&pkg), &mut removed).unwrap(), 0);
+        assert!(!pkg.exists());
+        fs::create_dir_all(&pkg).unwrap();
+        drop_empty_package(&pkg).unwrap();
+        assert!(!pkg.exists());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn gc_preserves_packages_with_legacy_names() {
+        for name in ["hold-0123456789abcdef", "build"] {
+            let tmp =
+                std::env::temp_dir().join(format!("build-dir-gc-name-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&tmp);
+            let pkg = tmp.join("debug/build").join(name);
+            let unit = pkg.join("fedcba9876543210");
+            fs::create_dir_all(unit.join("fingerprint")).unwrap();
+            fs::write(unit.join("fingerprint/invoked.timestamp"), "queued").unwrap();
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(pkg.join(GC_LOCK_FILE))
+                .unwrap();
+            flock::lock_shared(&lock).unwrap();
+            let settings = GcSettings {
+                max_unused: Duration::ZERO,
+                max_size: MaxSize::Bytes(0),
+                ..GcSettings::default()
+            };
+            let mut removed = Removed::default();
+            let collect = |live: &HashSet<PathBuf>, removed: &mut Removed| {
+                collect(&tmp, live, 0, FileTime::now(), &settings, None, removed).unwrap();
+            };
+            collect(&HashSet::default(), &mut removed);
+            assert!(unit.join("fingerprint/invoked.timestamp").is_file());
+            // Even a package-level candidate must respect the guard.
+            remove(&pkg, Some(&pkg), &mut removed).unwrap();
+            assert!(unit.is_dir());
+            drop(lock);
+            remove(&pkg, Some(&pkg), &mut removed).unwrap();
+            assert!(unit.is_dir());
+            collect(&HashSet::from_iter([unit.clone()]), &mut removed);
+            assert!(unit.is_dir());
+            collect(&HashSet::default(), &mut removed);
+            assert!(!unit.exists());
+            assert!(!pkg.exists());
+
+            let legacy = tmp.join("debug/build/old-0123456789abcdef");
+            fs::create_dir_all(legacy.join("out")).unwrap();
+            fs::write(legacy.join("output"), "old").unwrap();
+            collect(&HashSet::default(), &mut removed);
+            assert!(!legacy.join("out").exists());
+            assert!(!legacy.join("output").exists());
+            assert!(!legacy.exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
+    }
+
+    #[test]
+    fn repeated_gc_removes_empty_packages() {
+        let tmp = std::env::temp_dir().join(format!("build-dir-gc-repeat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        for name in ["plain", "x-0123456789abcdef"] {
+            let pkg = tmp.join("debug/build").join(name);
+            fs::create_dir_all(pkg.join("fedcba9876543210")).unwrap();
+            fs::write(pkg.join("fedcba9876543210/output"), "old").unwrap();
+        }
+        let legacy = tmp.join("debug/build/old-0123456789abcdef");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("output"), "old").unwrap();
+        let settings = GcSettings {
+            max_unused: Duration::ZERO,
+            max_size: MaxSize::None,
+            ..GcSettings::default()
+        };
+        for run in 0..3 {
+            let mut removed = Removed::default();
+            collect(
+                &tmp,
+                &HashSet::default(),
+                0,
+                FileTime::now(),
+                &settings,
+                None,
+                &mut removed,
+            )
+            .unwrap();
+            if run > 0 {
+                assert_eq!(removed.count, 0);
+            }
+        }
+        assert!(read_dirs(&tmp.join("debug/build")).unwrap().is_empty());
+        fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn tmp_build_paths_have_no_package_lock() {
+        for idle in [false, true] {
+            let tmp = std::env::temp_dir().join(format!(
+                "build-dir-gc-tmp-build-{}-{idle}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&tmp);
+            let data = tmp.join("tmp/x/build/data");
+            fs::create_dir_all(&data).unwrap();
+            fs::write(data.join("output"), "old").unwrap();
+            for path in [&data, &data.join("output")] {
+                filetime::set_file_mtime(path, days_ago(3)).unwrap();
+            }
+            let mut removed = Removed::default();
+            if idle {
+                strip_idle_project(&tmp, Duration::from_secs(24 * 3600), &mut removed).unwrap();
+            } else {
+                let settings = GcSettings {
+                    max_size: MaxSize::None,
+                    ..GcSettings::default()
+                };
+                collect(
+                    &tmp,
+                    &HashSet::default(),
+                    0,
+                    FileTime::now(),
+                    &settings,
+                    None,
+                    &mut removed,
+                )
+                .unwrap();
+            }
+            assert!(!tmp.join("tmp/x/build").join(GC_LOCK_FILE).exists());
+            assert!(!data.exists());
+            fs::remove_dir_all(tmp).unwrap();
+        }
     }
 
     #[test]
@@ -1485,7 +1875,7 @@ mod tests {
         let mut units = units;
         let mut removed = Removed::default();
         let day = Duration::from_secs(24 * 3600);
-        remove_superseded_variants(&mut units, &live, day, &mut removed).unwrap();
+        remove_superseded_variants(&mut units, None, &live, day, &mut removed).unwrap();
         let mut left: Vec<_> = units
             .iter()
             .map(|(u, _)| u.file_name().unwrap().to_str().unwrap().to_string())
